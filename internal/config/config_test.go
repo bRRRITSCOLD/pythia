@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -85,6 +86,39 @@ func TestLoad_InvalidBashTimeout_ReturnsError(t *testing.T) {
 	}
 }
 
+// TestLoad_ZeroOrNegativeTuningKnob_ReturnsError locks in the security
+// constraint from issue #77 (SR-3, SR-4a, SR-4b, SR-4c): every gt=0 tuning
+// knob must be rejected at startup when set to zero or negative, so the
+// values these limits protect can never be zero/negative.
+func TestLoad_ZeroOrNegativeTuningKnob_ReturnsError(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   string
+		value string
+	}{
+		{"BashTimeoutZero", "PYTHIA_BASH_TIMEOUT", "0s"},
+		{"BashTimeoutNegative", "PYTHIA_BASH_TIMEOUT", "-5s"},
+		{"MaxReadBytesZero", "PYTHIA_MAX_READ_BYTES", "0"},
+		{"MaxReadBytesNegative", "PYTHIA_MAX_READ_BYTES", "-1"},
+		{"MaxBashOutputBytesZero", "PYTHIA_MAX_BASH_OUTPUT_BYTES", "0"},
+		{"MaxBashOutputBytesNegative", "PYTHIA_MAX_BASH_OUTPUT_BYTES", "-1"},
+		{"MaxIterationsZero", "PYTHIA_MAX_ITERATIONS", "0"},
+		{"MaxIterationsNegative", "PYTHIA_MAX_ITERATIONS", "-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			unsetAll(t)
+			t.Setenv("PYTHIA_WORKSPACE_ROOT", t.TempDir())
+			t.Setenv(tt.env, tt.value)
+
+			if _, err := config.Load(); err == nil {
+				t.Fatalf("Load() error = nil, want error for %s=%q", tt.env, tt.value)
+			}
+		})
+	}
+}
+
 func TestLoad_NonexistentWorkspaceRoot_FailsValidation(t *testing.T) {
 	unsetAll(t)
 	t.Setenv("PYTHIA_WORKSPACE_ROOT", "/this/path/does/not/exist/pythia-test")
@@ -119,8 +153,12 @@ func TestLoad_AllEnvSet_OverridesDefaults(t *testing.T) {
 	if cfg.OllamaModel != "custom-model" {
 		t.Errorf("OllamaModel = %q", cfg.OllamaModel)
 	}
-	if cfg.WorkspaceRoot != dir {
-		t.Errorf("WorkspaceRoot = %q, want %q", cfg.WorkspaceRoot, dir)
+	wantRoot, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("filepath.EvalSymlinks(%q): %v", dir, err)
+	}
+	if cfg.WorkspaceRoot != wantRoot {
+		t.Errorf("WorkspaceRoot = %q, want %q (canonicalized)", cfg.WorkspaceRoot, wantRoot)
 	}
 	if cfg.DBPath != "/tmp/custom.db" {
 		t.Errorf("DBPath = %q", cfg.DBPath)

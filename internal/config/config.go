@@ -10,6 +10,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -64,6 +65,19 @@ func Load() (Config, error) {
 		workspaceRoot = cwd
 	}
 
+	// Canonicalize WorkspaceRoot to an absolute, symlink-evaluated path
+	// before validation. WorkspaceRoot is the containment root for
+	// downstream path-traversal defense (SR-4); resolving it once here
+	// keeps containment comparisons in adapters robust against relative
+	// paths or symlinks.
+	if resolved, err := canonicalizeDir(workspaceRoot); err == nil {
+		workspaceRoot = resolved
+	}
+	// If resolution fails (e.g. the path doesn't exist), leave
+	// workspaceRoot as-is and let the `dir` validator below report the
+	// error — canonicalization is best-effort and must not mask or
+	// replace validation.
+
 	bashTimeout, err := parseDuration(envBashTimeout, defaultBashTimeout)
 	if err != nil {
 		return Config{}, err
@@ -101,6 +115,19 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// canonicalizeDir resolves dir to an absolute, symlink-evaluated path.
+func canonicalizeDir(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	return resolved, nil
 }
 
 func stringOrDefault(env, def string) string {
