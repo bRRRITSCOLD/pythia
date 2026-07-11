@@ -84,3 +84,17 @@ All in `/home/blaine-richardson/Code/github/bRRRITSCOLD/pythia` (pushed to GitHu
 - WASI preview2/component-model migration: ADR-0006 chose preview1 for the slice; revisit when
   skill ecosystem grows.
 - Issue #18 is a retired duplicate on GitHub — cosmetic gap in numbering, ignore.
+
+## 8. Next-session prompt (copy-paste)
+
+```
+read docs/superpowers/handoffs/2026-07-10-design-phase-complete.md to catch up, then run
+/compainy:orchestrate for the "Vertical slice — thin thread" milestone in bRRRITSCOLD/pythia.
+Use the Workflow tool (dynamic multi-agent orchestration) for the dispatch loop: fan out
+parallel-safe issues within each wave as concurrent agents, respect blocked-by links,
+staff-engineer review gate on every diff before merge, squash-merge off main. Stack is pure
+Rust (wasmtime, rusqlite, tokio, reqwest) — write .ai/stack-profile.md first so specialists
+don't assume the default stack. Merge gates run on MockProvider; Ollama qwen3.5 live tests
+are #[ignore]-gated. Done = issues #17 (durability demo) and #19 (safety demo) closed with
+green integration tests.
+```
