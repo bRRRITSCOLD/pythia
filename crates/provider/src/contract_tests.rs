@@ -59,10 +59,14 @@ async fn contract_tool_call_response_yields_tool_call_with_name_and_args<P: Prov
         "Contract_ToolCallResponse_YieldsToolCallWithNameAndArgs: expected exactly one chunk"
     );
     match &response[0] {
-        ResponseChunk::ToolCall(ToolCall { name, .. }) => {
+        ResponseChunk::ToolCall(ToolCall { name, arguments, .. }) => {
             assert!(
                 !name.is_empty(),
                 "Contract_ToolCallResponse_YieldsToolCallWithNameAndArgs: tool call name must not be empty"
+            );
+            assert!(
+                arguments.is_object(),
+                "Contract_ToolCallResponse_YieldsToolCallWithNameAndArgs: tool call arguments must be a JSON object, got {arguments:?}"
             );
         }
         other => panic!(
@@ -133,5 +137,8 @@ where
 /// so the suite can walk a fresh provider's canonical 3-entry script up to
 /// the scenario under test.
 async fn advance_one_call<P: Provider>(provider: &P) {
-    let _ = provider.request(&sample_messages(), &[]).await;
+    provider
+        .request(&sample_messages(), &[])
+        .await
+        .expect("contract suite: advancing the canonical script failed");
 }

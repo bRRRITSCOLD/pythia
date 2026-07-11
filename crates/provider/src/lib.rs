@@ -32,6 +32,19 @@ pub enum Role {
 /// carries no assumption about any specific provider's HTTP/JSON shape —
 /// translating to/from that shape is the implementer's job (e.g.
 /// `pythia-provider-ollama::wire`).
+///
+/// # Known deferral: tool-call/tool-result correlation (Task 15)
+/// This shape is deliberately minimal for the current slice and does not
+/// yet carry `tool_calls` on an assistant [`Message`] or a `tool_call_id`
+/// on a [`Role::Tool`] message. The kernel turn loop (Task 15) must replay
+/// "assistant requested tool X (id) → tool result for id" back to the
+/// provider, and the OpenAI-compatible dialect (Task 10) requires
+/// `assistant.tool_calls[]` / `tool.tool_call_id` on the wire. Extending
+/// `Message` (e.g. `tool_calls: Vec<ToolCall>` on the assistant turn, or a
+/// content enum) is expected before Task 15 lands, and should happen
+/// TDD-first since this is the frozen seam the contract suite and every
+/// provider implementer build against — do not let it slide silently into
+/// Task 10/15.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -90,7 +103,7 @@ pub struct ToolCall {
 /// implementers that talk to a chunked-HTTP wire (e.g. Ollama) collect their
 /// own stream into this `Vec` before returning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum ResponseChunk {
     Text(String),
     ToolCall(ToolCall),
@@ -125,4 +138,95 @@ pub trait Provider: Send + Sync {
         messages: &[Message],
         tools: &[ToolSchema],
     ) -> Result<Vec<ResponseChunk>, ProviderError>;
+}
+
+#[cfg(test)]
+mod wire_type_serde_tests {
+    //! Round-trip and JSON-shape tests for the wire types' derived
+    //! `Serialize`/`Deserialize` impls. These attributes (`rename_all`,
+    //! `tag`, `content`) define the exact JSON contract the kernel persists
+    //! as `payload_json` in the event log — a compiling derive is not
+    //! evidence the shape is representable at runtime (see the
+    //! `ResponseChunk::Text` internal-tagging bug this suite now guards
+    //! against).
+
+    use super::*;
+    use serde_json::json;
+
+    fn round_trip<T>(value: &T)
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        let json = serde_json::to_string(value).expect("serialize should succeed");
+        let back: T = serde_json::from_str(&json).expect("deserialize should succeed");
+        assert_eq!(value, &back, "round-trip should preserve equality");
+    }
+
+    #[test]
+    fn message_round_trips_through_json() {
+        round_trip(&Message::user("hello"));
+        round_trip(&Message::system("be helpful"));
+        round_trip(&Message::assistant("hi there"));
+        round_trip(&Message::tool("42"));
+    }
+
+    #[test]
+    fn tool_schema_round_trips_through_json() {
+        round_trip(&ToolSchema {
+            name: "get_weather".to_string(),
+            description: "fetch current weather".to_string(),
+            parameters_schema: json!({"type": "object", "properties": {}}),
+        });
+    }
+
+    #[test]
+    fn tool_call_round_trips_through_json() {
+        round_trip(&ToolCall {
+            id: "call_1".to_string(),
+            name: "get_weather".to_string(),
+            arguments: json!({"city": "Seattle"}),
+        });
+    }
+
+    #[test]
+    fn response_chunk_text_round_trips_through_json() {
+        round_trip(&ResponseChunk::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn response_chunk_tool_call_round_trips_through_json() {
+        round_trip(&ResponseChunk::ToolCall(ToolCall {
+            id: "call_1".to_string(),
+            name: "get_weather".to_string(),
+            arguments: json!({"city": "Seattle"}),
+        }));
+    }
+
+    #[test]
+    fn response_chunk_text_serializes_to_expected_shape() {
+        let value = serde_json::to_value(ResponseChunk::Text("hello".to_string()))
+            .expect("serialize should succeed");
+        assert_eq!(value, json!({"kind": "text", "data": "hello"}));
+    }
+
+    #[test]
+    fn response_chunk_tool_call_serializes_to_expected_shape() {
+        let value = serde_json::to_value(ResponseChunk::ToolCall(ToolCall {
+            id: "call_1".to_string(),
+            name: "get_weather".to_string(),
+            arguments: json!({"city": "Seattle"}),
+        }))
+        .expect("serialize should succeed");
+        assert_eq!(
+            value,
+            json!({
+                "kind": "tool_call",
+                "data": {
+                    "id": "call_1",
+                    "name": "get_weather",
+                    "arguments": {"city": "Seattle"}
+                }
+            })
+        );
+    }
 }
