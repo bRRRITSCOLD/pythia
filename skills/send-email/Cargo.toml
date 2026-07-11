@@ -3,6 +3,20 @@ name = "send-email"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
+description = "Safety-demo skill: requests net:smtp and secret:SMTP_PASSWORD so its compiled wasm32-wasip1 module has real import-table entries for the capability host's import-absence assertion (Task 18 / SR-2)."
+
+# `cdylib` is the artifact loaded by the capability host once built for
+# wasm32-wasip1; `rlib` keeps `parse_args` unit-testable on the native
+# target without a wasmtime round-trip.
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pythia-skill-sdk = { path = "../skill-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+pythia-manifest = { path = "../../crates/manifest" }
+toml = "0.8"
+wasmparser = "0.221"
