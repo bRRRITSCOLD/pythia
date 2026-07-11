@@ -50,15 +50,26 @@ impl Config {
     /// relative `pythia.db` file, `http://localhost:11434`) for anything unset. Never a
     /// hardcoded remote endpoint or credential — the BYO-endpoint constraint holds even for the
     /// defaults, since `localhost` is not a hosted, subscription-authenticated service.
+    ///
+    /// Thin wrapper over the pure `from_vars` — all fallback logic lives there so it can be
+    /// exercised with a stub lookup instead of mutating real process-global env state.
     pub fn from_env() -> Self {
+        Self::from_vars(|key| env::var(key).ok())
+    }
+
+    /// Pure lookup-driven config resolution: `lookup` maps an `ENV_*` key to its raw string value
+    /// (or `None` if unset), and this applies the same defaulting logic `from_env` used to apply
+    /// directly against `std::env::var`. Keeping this free of any real env access makes the
+    /// fallback path deterministically and parallel-safe testable (no process-global state).
+    pub fn from_vars(lookup: impl Fn(&str) -> Option<String>) -> Self {
         Self {
-            db_path: env::var(ENV_DB_PATH)
+            db_path: lookup(ENV_DB_PATH)
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(DEFAULT_DB_PATH)),
-            ollama_base_url: env::var(ENV_OLLAMA_BASE_URL)
-                .unwrap_or_else(|_| DEFAULT_OLLAMA_BASE_URL.to_string()),
-            ollama_model: env::var(ENV_OLLAMA_MODEL).ok(),
-            policy_path: env::var(ENV_POLICY_PATH).ok().map(PathBuf::from),
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH)),
+            ollama_base_url: lookup(ENV_OLLAMA_BASE_URL)
+                .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string()),
+            ollama_model: lookup(ENV_OLLAMA_MODEL),
+            policy_path: lookup(ENV_POLICY_PATH).map(PathBuf::from),
         }
     }
 }
@@ -131,21 +142,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn Config_FromEnv_MissingVars_FallsBackToDefaults() {
-        // Use process-unique env var names so this test is safe under parallel `cargo test`
-        // (env vars are process-global) without needing a serialization lock — this test reads
-        // via `Config::from_env` which reads the real names, so instead assert the constants and
-        // the pure default logic path directly by constructing what `from_env` would produce
-        // when the vars are absent.
-        let config = Config {
-            db_path: PathBuf::from(DEFAULT_DB_PATH),
-            ollama_base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
-            ollama_model: None,
-            policy_path: None,
-        };
+    fn FromVars_AllUnset_FallsBackToDefaults() {
+        let config = Config::from_vars(|_| None);
 
         assert_eq!(config.db_path, PathBuf::from("pythia.db"));
         assert_eq!(config.ollama_base_url, "http://localhost:11434");
+        assert_eq!(config.ollama_model, None);
+        assert_eq!(config.policy_path, None);
+    }
+
+    #[test]
+    fn FromVars_AllSet_ReadsEachVar() {
+        let config = Config::from_vars(|key| match key {
+            ENV_DB_PATH => Some("custom.db".to_string()),
+            ENV_OLLAMA_BASE_URL => Some("http://example.internal:9999".to_string()),
+            ENV_OLLAMA_MODEL => Some("llama3".to_string()),
+            ENV_POLICY_PATH => Some("policy.toml".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(config.db_path, PathBuf::from("custom.db"));
+        assert_eq!(config.ollama_base_url, "http://example.internal:9999");
+        assert_eq!(config.ollama_model, Some("llama3".to_string()));
+        assert_eq!(config.policy_path, Some(PathBuf::from("policy.toml")));
+    }
+
+    #[test]
+    fn FromVars_PolicyPathSet_ParsedAsPathBuf() {
+        let config = Config::from_vars(|key| {
+            (key == ENV_POLICY_PATH).then(|| "/etc/pythia/policy.toml".to_string())
+        });
+
+        assert_eq!(
+            config.policy_path,
+            Some(PathBuf::from("/etc/pythia/policy.toml"))
+        );
     }
 
     #[test]
