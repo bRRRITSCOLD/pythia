@@ -142,7 +142,20 @@ impl<P: Provider> Kernel<P> {
                     }
                 }
                 NextAction::DispatchTool(tool_call) => {
-                    let event = dispatch_tool(&tool_call, &self.skills, &self.policy);
+                    // `next_action` only ever returns `DispatchTool` when the last event in
+                    // `history` is the triggering `LlmResponse` that carried `tool_call` (data
+                    // model doc §5 / turn.rs's own contract) — so its taint is right here,
+                    // no re-fetch needed.
+                    let triggering_tainted = history
+                        .last()
+                        .map(KernelEvent::tainted)
+                        .unwrap_or(false);
+                    let event = dispatch_tool(
+                        &tool_call,
+                        &self.skills,
+                        &self.policy,
+                        triggering_tainted,
+                    );
                     self.append_event(&turn_id, event)?;
                 }
                 NextAction::Complete => {

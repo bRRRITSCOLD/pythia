@@ -33,10 +33,20 @@ pub struct SkillConfig {
 /// resource-limit kill all fold into a `ToolResult` with an appropriate `status` (data model doc
 /// §4 — a denial is itself a recorded fact, not a separate event type), exactly like
 /// `execute()`'s own three-status contract this function is built on top of.
+///
+/// `triggering_tainted` is the taint of the `LlmResponse` event that carried `tool_call` (the
+/// caller — `drive_turn` — already holds it, since dispatch only ever follows reading that event
+/// off the history). The unregistered-tool denial below embeds `tool_call.name` verbatim into its
+/// `reason`, and that name is LLM-controlled: a `false` here would launder tainted, provider-
+/// supplied bytes into an untainted event (SR-8, data model doc §7). The granted/denied/
+/// resource-limit arms below don't take this parameter into account — their `tainted` already
+/// derives from `result.is_tainted()`, itself seeded from the skill's own declared taint, which is
+/// the correct source of truth once a real skill ran.
 pub(crate) fn dispatch_tool(
     tool_call: &ToolCall,
     skills: &HashMap<String, SkillConfig>,
     policy: &PolicyFile,
+    triggering_tainted: bool,
 ) -> KernelEvent {
     let Some(skill) = skills.get(&tool_call.name) else {
         return KernelEvent::ToolResult {
@@ -44,7 +54,7 @@ pub(crate) fn dispatch_tool(
             status: "denied".to_string(),
             output: String::new(),
             reason: Some(format!("no skill registered for tool `{}`", tool_call.name)),
-            tainted: false,
+            tainted: triggering_tainted,
         };
     };
 
@@ -198,7 +208,7 @@ mod tests {
             arguments: serde_json::json!({"path": file_path.to_string_lossy()}),
         };
 
-        let event = dispatch_tool(&tool_call, &skills, &policy);
+        let event = dispatch_tool(&tool_call, &skills, &policy, true);
 
         match event {
             KernelEvent::ToolResult {
@@ -231,10 +241,40 @@ mod tests {
             arguments: serde_json::json!({}),
         };
 
-        let event = dispatch_tool(&tool_call, &skills, &policy);
+        let event = dispatch_tool(&tool_call, &skills, &policy, false);
 
         match event {
             KernelEvent::ToolResult { status, .. } => assert_eq!(status, "denied"),
+            other => panic!("expected a ToolResult event, got {other:?}"),
+        }
+    }
+
+    /// SR-8 (data model doc §7): the unregistered-tool denial's `reason` embeds
+    /// `tool_call.name` verbatim, and that name came from a tainted `LlmResponse` (the LLM is
+    /// always an untrusted source). The denial must inherit that taint rather than hardcoding
+    /// `tainted: false`, or a downstream taint pre-check would be fed laundered-clean data.
+    #[test]
+    fn Dispatch_UnregisteredTool_DenialInheritsTriggeringLlmResponseTaint() {
+        let skills = HashMap::new();
+        let policy = PolicyFile::default();
+        let tool_call = ToolCall {
+            name: "no_such_tool".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        let event = dispatch_tool(&tool_call, &skills, &policy, true);
+
+        match event {
+            KernelEvent::ToolResult {
+                status, tainted, ..
+            } => {
+                assert_eq!(status, "denied");
+                assert!(
+                    tainted,
+                    "denial reason embeds an LLM-controlled tool name; it must inherit the \
+                     triggering LlmResponse's taint (SR-8) rather than hardcode false"
+                );
+            }
             other => panic!("expected a ToolResult event, got {other:?}"),
         }
     }
