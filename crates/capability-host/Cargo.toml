@@ -7,3 +7,9 @@ publish.workspace = true
 [dependencies]
 pythia-manifest = { path = "../manifest" }
 wasmtime = "36"
+wasmtime-wasi = { version = "36", features = ["preview1"] }
+anyhow = "1"
+
+[dev-dependencies]
+wat = "1"
+tempfile = "3"
