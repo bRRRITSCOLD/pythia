@@ -24,10 +24,6 @@ use wasmtime::{Caller, Engine, Linker};
 use crate::host_fns;
 use crate::HostState;
 
-/// Import module namespace for Pythia's own host functions, distinct from
-/// `wasi_snapshot_preview1`.
-pub(crate) const HOST_MODULE: &str = "pythia_host";
-
 /// WASI preview1's own import module namespace -- the fixed name `wasmtime_wasi::preview1`
 /// registers every WASI function under (per the `wasi_snapshot_preview1` witx module), and the
 /// same name a `poll_oneoff` override below must target to land in the same linker slot.
@@ -100,13 +96,24 @@ fn import_name_for(capability: &Capability) -> Option<String> {
 /// `secret_get`, Task 8), or the placeholder for the rest (`net_*_send` — Task 7). Every branch
 /// still registers *an* import slot for a granted capability; which body runs is the only thing
 /// that changes per task.
+///
+/// Registered under `host_fn::WASM_IMPORT_MODULE` (`"pythia"`) -- the same module name
+/// `pythia_manifest::host_fn` and the skill SDK's `#[link(wasm_import_module = "pythia")]`
+/// (`skills/skill-sdk/src/imports.rs`) both use. A real skill's compiled wasm import table
+/// therefore names entries `pythia.fs_read`, `pythia.secret_get`, `pythia.net_smtp_send`; this
+/// linker must register under the identical module name or instantiation fails on "unknown
+/// import" for every real skill (issue #32).
 fn register_import(linker: &mut Linker<HostState>, import_name: &str) -> Result<()> {
     if import_name == host_fn::FS_READ {
-        linker.func_wrap(HOST_MODULE, import_name, host_fns::fs::fs_read)?;
+        linker.func_wrap(host_fn::WASM_IMPORT_MODULE, import_name, host_fns::fs::fs_read)?;
     } else if import_name == host_fn::SECRET_GET {
-        linker.func_wrap(HOST_MODULE, import_name, host_fns::secret::secret_get)?;
+        linker.func_wrap(
+            host_fn::WASM_IMPORT_MODULE,
+            import_name,
+            host_fns::secret::secret_get,
+        )?;
     } else {
-        linker.func_wrap(HOST_MODULE, import_name, placeholder)?;
+        linker.func_wrap(host_fn::WASM_IMPORT_MODULE, import_name, placeholder)?;
     }
     Ok(())
 }
