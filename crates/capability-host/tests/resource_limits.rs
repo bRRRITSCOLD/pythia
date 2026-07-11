@@ -77,6 +77,17 @@ const TABLE_GROW_WITHIN_CAP_WAT: &str = r#"
             (table.grow (ref.null func) (i32.const 100))))
 "#;
 
+/// Declares TWO linear memories. The per-memory ceiling (16 MiB) would pass each individually,
+/// but two (or ~100) memories aggregate past the intended per-Store ceiling -- the SR-6 multi-mem
+/// host-OOM bypass. With `wasm_multi_memory(false)` this module fails to even validate/compile,
+/// so instantiation is rejected before any allocation happens.
+const MULTI_MEMORY_WAT: &str = r#"
+    (module
+        (memory (export "memory") 1)
+        (memory 1)
+        (func (export "noop")))
+"#;
+
 #[test]
 fn Fuel_InfiniteLoopSkill_ForceTerminatedWithinBudget() {
     let module_bytes = wat::parse_str(INFINITE_LOOP_WAT).expect("wat parses");
@@ -226,4 +237,21 @@ fn Table_SelfDeclaredTableGrownWithinCap_Succeeds() {
         ),
         Err(other) => panic!("expected growth within the cap to succeed, got {other}"),
     }
+}
+
+#[test]
+fn Memory_ModuleDeclaringMultipleLinearMemories_RejectedNotAggregated() {
+    // SR-6 multi-memory host-OOM bypass: many memories each under the 16 MiB ceiling but
+    // aggregating past it. `wasm_multi_memory(false)` makes such a module invalid, so it is
+    // rejected at instantiate time -- no per-memory ceiling accounting can be gamed.
+    let module_bytes = wat::parse_str(MULTI_MEMORY_WAT).expect("wat parses");
+    let (manifest, policy) = zero_capability_manifest("multi-memory-skill");
+
+    let host = CapabilityHost::new().expect("engine constructs");
+    let result = host.instantiate(&module_bytes, &manifest, &policy);
+
+    assert!(
+        result.is_err(),
+        "a module declaring more than one linear memory must be rejected (multi-memory disabled)"
+    );
 }

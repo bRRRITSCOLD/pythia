@@ -209,6 +209,14 @@ impl CapabilityHost {
         // `Store::set_fuel` to have any effect -- see `limits::configure_limits`.
         let mut config = Config::new();
         config.consume_fuel(true);
+        // SR-6: the `MemoryLimiter` memory ceiling is enforced per *linear memory* by wasmtime's
+        // `ResourceLimiter` callback. With multi-memory enabled a module can declare ~100 memories,
+        // each individually under the 16 MiB ceiling but aggregating to ~1.6 GiB of host RSS — a
+        // zero-capability host-OOM bypass of the intended per-Store ceiling. Restrict every skill
+        // module to a single linear memory so the per-memory check *is* the per-Store ceiling.
+        // (Tables can't aggregate the same way: each is capped at TABLE_ELEMENT_LIMIT elements, so
+        // even ~100 tables total < 8 MiB — not a host-OOM vector.)
+        config.wasm_multi_memory(false);
         let engine = Engine::new(&config).map_err(HostError::Wasmtime)?;
 
         Ok(CapabilityHost { engine })
