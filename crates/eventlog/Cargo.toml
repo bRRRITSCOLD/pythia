@@ -1,0 +1,8 @@
+[package]
+name = "pythia-eventlog"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.33", features = ["bundled"] }

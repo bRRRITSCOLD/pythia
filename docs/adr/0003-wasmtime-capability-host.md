@@ -65,6 +65,15 @@ only the host's policy decides whether it is *granted*.
   implementation bugs are a real (if rare) historical class of WASM-runtime escape; this ADR accepts
   wasmtime's maturity and audit history as sufficient for the slice, not as a claim of unconditional
   safety.
+- **Supported-LTS-only version policy.** ADR-0003's "maturity and audit history" claim is only true of
+  a wasmtime line that is still receiving security fixes — an EOL line is exactly as unaudited as any
+  other abandoned dependency. Pythia pins `pythia-capability-host`'s wasmtime dependency to a
+  currently-supported line only: the active LTS (`wasmtime = "36"`, current floor >=36.0.7) or a newer
+  stable release, never a version past the end of its advisory-fix window. When the pinned line's
+  support window closes (Bytecode Alliance publishes wasmtime LTS end-of-life dates), bump to the next
+  supported LTS or current release within one sprint of that announcement — do not let the pin go
+  stale silently. Verified against RustSec advisory-db at each bump (see the CI cargo-audit/cargo-deny
+  gate tracked alongside the CI task).
 - wasmtime is a substantial dependency (JIT compiler, sizeable crate, its own platform-support
   surface) — real build-time and binary-size cost versus a lighter interpreter or no sandbox at all.
 - Skill authors are constrained to what compiles to `wasm32-wasip1`: no arbitrary native library
