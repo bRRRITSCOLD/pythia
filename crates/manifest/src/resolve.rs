@@ -110,7 +110,10 @@ mod tests {
     fn Resolve_WildcardRequestWithWildcardPolicyGrant_RoutesToPromptNeverAutoGranted() {
         let requested = vec![Capability::NetWildcard];
         // Even an explicit wildcard Grant in the policy must not auto-grant a wildcard request.
-        let policy = policy_with("read-file", vec![(Capability::NetWildcard, Decision::Grant)]);
+        let policy = policy_with(
+            "read-file",
+            vec![(Capability::NetWildcard, Decision::Grant)],
+        );
 
         let result = resolve(&requested, &policy, "read-file");
 
