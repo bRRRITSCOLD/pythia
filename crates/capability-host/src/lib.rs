@@ -11,10 +11,12 @@
 //! `fs_read` has a real body as of Task 6 (`host_fns::fs`, SR-3's per-call scope re-check);
 //! `net_*_send`/`secret_get` remain placeholder import slots until Task 8.
 //!
-//! It also owns SR-6 (fuel + memory limits, `limits.rs`): every `Store` carries an explicit fuel
-//! budget and a linear-memory ceiling, and exceeding either force-terminates the instance as a
-//! distinct `HostError::ResourceLimitExceeded` rather than hanging the kernel's single-threaded
-//! loop.
+//! It also owns SR-6 (fuel + memory/table limits, `limits.rs`): every `Store` carries an explicit
+//! fuel budget, a linear-memory ceiling, and a table-element ceiling (a module needs no capability
+//! grant to declare its own internal table, so this is bounded independently of the capability
+//! system -- see `limits::TABLE_ELEMENT_LIMIT`), and exceeding any of the three force-terminates
+//! the instance as a distinct `HostError::ResourceLimitExceeded` rather than hanging the kernel's
+//! single-threaded loop.
 
 mod host_fns;
 mod limits;
@@ -105,8 +107,10 @@ impl Instance {
 
         let call_args: Vec<Val> = args.iter().map(|&v| Val::I32(v)).collect();
         let mut results = [Val::I32(0)];
-        func.call(&mut self.store, &call_args, &mut results)
-            .map_err(|err| self.classify_call_error(err))?;
+        let call_result = func.call(&mut self.store, &call_args, &mut results);
+        if let Err(err) = call_result {
+            return Err(self.classify_call_error(err));
+        }
 
         match results.first() {
             Some(Val::I32(value)) => Ok(*value),
@@ -162,19 +166,31 @@ impl Instance {
     }
 
     /// SR-6: turns a failed call into `HostError::ResourceLimitExceeded` when it was caused by
-    /// fuel exhaustion or the store's memory ceiling, rather than surfacing it as an opaque
-    /// `HostError::Wasmtime`. Fuel exhaustion is a well-known wasmtime trap code
-    /// (`Trap::OutOfFuel`); the memory ceiling is this store's own `MemoryLimiter`, so its
-    /// `exceeded()` flag is checked directly rather than pattern-matching trap text.
-    fn classify_call_error(&self, err: anyhow::Error) -> HostError {
+    /// fuel exhaustion or one of the store's `MemoryLimiter` ceilings (linear memory or table
+    /// elements), rather than surfacing it as an opaque `HostError::Wasmtime`. Fuel exhaustion is
+    /// a well-known wasmtime trap code (`Trap::OutOfFuel`); the ceilings are this store's own
+    /// `MemoryLimiter`, so its `take_*_exceeded()` flags are checked directly rather than
+    /// pattern-matching trap text.
+    ///
+    /// Takes `&mut self` and *consumes* (take-and-resets) the limiter's flags rather than merely
+    /// reading them: an `Instance` is a single `Store` that a caller could technically keep
+    /// calling into after an error, and a plain read would let a stale `exceeded` flag from one
+    /// call misclassify an unrelated trap on a later call as the same resource-limit kill.
+    fn classify_call_error(&mut self, err: anyhow::Error) -> HostError {
         if matches!(err.downcast_ref::<Trap>(), Some(Trap::OutOfFuel)) {
             return HostError::ResourceLimitExceeded(
                 "fuel budget exhausted before the call completed".to_string(),
             );
         }
-        if self.store.data().limits.exceeded() {
+        let limits = &mut self.store.data_mut().limits;
+        if limits.take_memory_exceeded() {
             return HostError::ResourceLimitExceeded(
                 "linear memory ceiling exceeded before the call completed".to_string(),
+            );
+        }
+        if limits.take_table_exceeded() {
+            return HostError::ResourceLimitExceeded(
+                "table element ceiling exceeded before the call completed".to_string(),
             );
         }
         HostError::Wasmtime(err)
@@ -223,7 +239,10 @@ impl CapabilityHost {
             HostState {
                 wasi: wasi_ctx,
                 grants,
-                limits: limits::MemoryLimiter::new(limits::MEMORY_LIMIT_BYTES),
+                limits: limits::MemoryLimiter::new(
+                    limits::MEMORY_LIMIT_BYTES,
+                    limits::TABLE_ELEMENT_LIMIT,
+                ),
             },
         );
         limits::configure_limits(&mut store).map_err(HostError::Wasmtime)?;

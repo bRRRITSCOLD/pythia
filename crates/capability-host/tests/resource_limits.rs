@@ -1,8 +1,14 @@
-//! SR-6: every skill instantiation carries an explicit fuel budget and linear-memory ceiling.
-//! Exceeding either force-terminates the instance -- surfaced as a distinct
-//! `HostError::ResourceLimitExceeded`, never conflated with `HostError::CapabilityDenied` or a
-//! generic `HostError::Wasmtime` -- and control returns to the caller instead of hanging the
+//! SR-6: every skill instantiation carries an explicit fuel budget, linear-memory ceiling, and
+//! table-element ceiling. Exceeding any of the three force-terminates the instance -- surfaced as
+//! a distinct `HostError::ResourceLimitExceeded`, never conflated with `HostError::CapabilityDenied`
+//! or a generic `HostError::Wasmtime` -- and control returns to the caller instead of hanging the
 //! (single-threaded) kernel loop.
+//!
+//! The table ceiling exists because a skill needs no capability grant to declare its own internal
+//! `(table N funcref)`: unlike linear memory there is no host-managed resource being referenced, so
+//! import-absence (SR-2's mechanism) has nothing to gate. Left unbounded, a capability-free skill
+//! could commit tens of gigabytes with a single `table.grow` instruction (one fuel unit),
+//! OOM-killing the host process before fuel or the memory ceiling ever engaged.
 
 #![allow(non_snake_case)]
 
@@ -48,6 +54,27 @@ const UNBOUNDED_GROW_WAT: &str = r#"
                 (drop (memory.grow (i32.const 1)))
                 br $l)
             i32.const 0))
+"#;
+
+/// Declares its *own* internal funcref table (no import, no capability grant possible or needed)
+/// and grows it, in a single instruction, by 20,000 elements -- past `TABLE_ELEMENT_LIMIT`
+/// (10,000) but trivially small in fuel terms (one `table.grow`). This is exactly the SR-6 host-OOM
+/// shape the table ceiling closes: with an unbounded `table_growing`, a request like this (or a
+/// multi-billion-element one) would previously have been granted outright.
+const TABLE_GROW_OVER_CAP_WAT: &str = r#"
+    (module
+        (table (export "table") 1 funcref)
+        (func (export "grow_over_cap") (result i32)
+            (table.grow (ref.null func) (i32.const 20000))))
+"#;
+
+/// Grows the same kind of self-declared table, but by an amount well inside `TABLE_ELEMENT_LIMIT`
+/// -- exercises that legitimate, bounded table growth is unaffected by the new ceiling.
+const TABLE_GROW_WITHIN_CAP_WAT: &str = r#"
+    (module
+        (table (export "table") 1 funcref)
+        (func (export "grow_within_cap") (result i32)
+            (table.grow (ref.null func) (i32.const 100))))
 "#;
 
 #[test]
@@ -150,5 +177,53 @@ fn ResourceLimitExceeded_SurfacedAsDistinctHostErrorVariant() {
             panic!("expected ResourceLimitExceeded, got opaque Wasmtime({err})")
         }
         Ok(value) => panic!("expected ResourceLimitExceeded, got Ok({value})"),
+    }
+}
+
+#[test]
+fn Table_SelfDeclaredTableGrownOverCap_ForceTerminatedAsResourceLimitExceeded() {
+    // A skill requesting zero capabilities can still declare its own table -- no import slot, no
+    // grant needed -- so this reuses `zero_capability_manifest` deliberately, to demonstrate the
+    // ceiling holds even against a skill the capability system has nothing to deny.
+    let module_bytes = wat::parse_str(TABLE_GROW_OVER_CAP_WAT).expect("wat parses");
+    let (manifest, policy) = zero_capability_manifest("table-over-cap-skill");
+
+    let host = CapabilityHost::new().expect("engine constructs");
+    let mut instance = host
+        .instantiate(&module_bytes, &manifest, &policy)
+        .expect("instantiation succeeds (the module's own table starts at 1 element)");
+
+    let result = instance.call_i32("grow_over_cap", &[]);
+
+    match result {
+        Err(HostError::ResourceLimitExceeded(reason)) => {
+            assert!(
+                reason.to_lowercase().contains("table"),
+                "expected the reason to mention the table ceiling, got: {reason}"
+            );
+        }
+        Ok(value) => panic!("expected ResourceLimitExceeded, got Ok({value})"),
+        Err(other) => panic!("expected ResourceLimitExceeded, got {other}"),
+    }
+}
+
+#[test]
+fn Table_SelfDeclaredTableGrownWithinCap_Succeeds() {
+    let module_bytes = wat::parse_str(TABLE_GROW_WITHIN_CAP_WAT).expect("wat parses");
+    let (manifest, policy) = zero_capability_manifest("table-within-cap-skill");
+
+    let host = CapabilityHost::new().expect("engine constructs");
+    let mut instance = host
+        .instantiate(&module_bytes, &manifest, &policy)
+        .expect("instantiation succeeds");
+
+    let result = instance.call_i32("grow_within_cap", &[]);
+
+    match result {
+        Ok(previous_size) => assert!(
+            previous_size >= 0,
+            "table.grow should report the table's prior size on success, got {previous_size}"
+        ),
+        Err(other) => panic!("expected growth within the cap to succeed, got {other}"),
     }
 }
