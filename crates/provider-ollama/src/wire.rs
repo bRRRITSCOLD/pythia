@@ -106,16 +106,29 @@ pub(crate) struct WireToolCallFunction {
 /// (matching real OpenAI's strict wire contract). Accept either and
 /// normalize to a `serde_json::Value` object so the kernel never sees the
 /// discrepancy.
+///
+/// After normalization the value must actually be a JSON object — a
+/// stringified scalar (`"42"`, `"\"hi\""`) or a raw `null` decodes without
+/// error but is not valid tool-call arguments, and must not be allowed to
+/// pass through silently as a non-object `ToolCall::arguments`.
 fn deserialize_arguments<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = serde_json::Value::deserialize(deserializer)?;
-    match raw {
+    let normalized = match raw {
         serde_json::Value::String(encoded) => {
-            serde_json::from_str(&encoded).map_err(serde::de::Error::custom)
+            serde_json::from_str(&encoded).map_err(serde::de::Error::custom)?
         }
-        other => Ok(other),
+        other => other,
+    };
+
+    if normalized.is_object() {
+        Ok(normalized)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "tool-call arguments must decode to a JSON object, got: {normalized}"
+        )))
     }
 }
 
@@ -256,5 +269,123 @@ mod tests {
         let result = response.into_response_chunks();
 
         assert!(matches!(result, Err(WireTranslationError::NoChoices)));
+    }
+
+    #[test]
+    fn wire_tool_call_with_stringified_non_object_arguments_fails_to_parse() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "42"
+                        }
+                    }]
+                }
+            }]
+        });
+
+        let result: Result<ChatResponse, _> = serde_json::from_value(body);
+
+        assert!(
+            result.is_err(),
+            "a stringified scalar must not silently pass through as tool-call arguments"
+        );
+    }
+
+    #[test]
+    fn wire_tool_call_with_stringified_quoted_scalar_arguments_fails_to_parse() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "\"hi\""
+                        }
+                    }]
+                }
+            }]
+        });
+
+        let result: Result<ChatResponse, _> = serde_json::from_value(body);
+
+        assert!(
+            result.is_err(),
+            "a stringified quoted scalar must not silently pass through as tool-call arguments"
+        );
+    }
+
+    #[test]
+    fn wire_tool_call_with_null_arguments_fails_to_parse() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": null
+                        }
+                    }]
+                }
+            }]
+        });
+
+        let result: Result<ChatResponse, _> = serde_json::from_value(body);
+
+        assert!(
+            result.is_err(),
+            "a raw null must not silently pass through as tool-call arguments"
+        );
+    }
+
+    #[test]
+    fn wire_empty_content_alongside_tool_calls_omits_text_chunk() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": {"path": "/tmp/example.txt"}
+                        }
+                    }]
+                }
+            }]
+        });
+
+        let response: ChatResponse =
+            serde_json::from_value(body).expect("valid response body should parse");
+        let chunks = response
+            .into_response_chunks()
+            .expect("translation should succeed");
+
+        assert_eq!(
+            chunks,
+            vec![ResponseChunk::ToolCall(ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "/tmp/example.txt"}),
+            })],
+            "empty-string content alongside tool_calls (common Ollama/OpenAI-dialect shape) \
+             must not produce a spurious empty text chunk"
+        );
     }
 }

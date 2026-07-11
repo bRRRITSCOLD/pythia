@@ -6,10 +6,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pythia_provider::contract_tests::run_provider_contract_tests;
-use pythia_provider::{Message, Provider};
+use pythia_provider::{Message, Provider, ToolSchema};
 use pythia_provider_ollama::OllamaProvider;
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// Returns canned OpenAI-compatible response bodies in order, one per call
@@ -140,6 +140,112 @@ async fn wire_malformed_response_body_errors_not_panics() {
     assert!(
         result.is_err(),
         "Wire_MalformedResponseBody_ErrorsNotPanics: expected an error, got {result:?}"
+    );
+}
+
+/// The request-serialization half of the wire module (ADR-0005) has no
+/// coverage from the contract suite above, which only exercises
+/// *responses* — `ScriptedResponder` ignores the incoming request
+/// entirely. Assert the outgoing JSON body directly for a text-only
+/// request: role mapping, `stream: false`, and `tools` omitted when empty.
+#[tokio::test]
+async fn wire_text_only_request_serializes_expected_openai_compatible_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({
+            "model": "qwen3.5",
+            "stream": false,
+            "messages": [
+                { "role": "system", "content": "be helpful" },
+                { "role": "user", "content": "hi there" }
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "hello" }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OllamaProvider::new(server.uri());
+    let result = provider
+        .request(
+            &[Message::system("be helpful"), Message::user("hi there")],
+            &[],
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "expected the scripted mock (matched on the exact request body) to respond, got {result:?}"
+    );
+
+    // `tools` must be omitted entirely (not an empty array) when no tools
+    // are supplied — assert against the request wiremock actually received,
+    // not just that *some* mock matched.
+    let requests = server.received_requests().await.expect("recording enabled");
+    assert_eq!(requests.len(), 1);
+    let sent: Value =
+        serde_json::from_slice(&requests[0].body).expect("request body should be valid JSON");
+    assert!(
+        sent.get("tools").is_none(),
+        "expected `tools` field to be omitted when no tools are supplied, got {sent}"
+    );
+}
+
+/// Same coverage gap as above, for a tool-bearing request: the
+/// `{"type":"function"}` tool wrapper and the `parameters` field name.
+#[tokio::test]
+async fn wire_tool_bearing_request_serializes_expected_openai_compatible_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({
+            "model": "qwen3.5",
+            "stream": false,
+            "messages": [
+                { "role": "user", "content": "read the file" }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Reads a file from disk",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } }
+                    }
+                }
+            }]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "ok" }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OllamaProvider::new(server.uri());
+    let tool = ToolSchema {
+        name: "read_file".to_string(),
+        description: "Reads a file from disk".to_string(),
+        parameters_schema: json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } }
+        }),
+    };
+    let result = provider
+        .request(&[Message::user("read the file")], &[tool])
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "expected the scripted mock (matched on the exact request body, \
+         including the {{\"type\":\"function\"}} wrapper and `parameters` field name) \
+         to respond, got {result:?}"
     );
 }
 
