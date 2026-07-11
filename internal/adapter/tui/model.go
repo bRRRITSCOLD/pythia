@@ -54,7 +54,13 @@ type Model struct {
 
 	input    textarea.Model
 	viewport viewport.Model
-	content  strings.Builder // accumulated, already-sanitized transcript
+	// content is a *strings.Builder (not a value) because tea.Model's
+	// Update/View methods have value receivers: Bubble Tea copies Model on
+	// every dispatch. A strings.Builder value field would panic ("illegal
+	// use of non-zero Builder copied by value") the moment it's written to
+	// more than once across copies; a pointer field copies cleanly since
+	// every copy still points at the same one Builder.
+	content *strings.Builder // accumulated, already-sanitized transcript
 
 	status string // current status line text
 	busy   bool   // a turn is in flight; submit is disabled while true
@@ -83,6 +89,7 @@ func NewModel(a *core.Agent, sessionID string) Model {
 		sessionID: sessionID,
 		input:     ta,
 		viewport:  vp,
+		content:   &strings.Builder{},
 		status:    "ready",
 	}
 }
