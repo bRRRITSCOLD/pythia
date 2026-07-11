@@ -40,9 +40,13 @@ fn Instantiate_ZeroCapabilityManifest_NoImportsLinked() {
 
 #[test]
 fn Instantiate_GrantedCapability_MatchingImportLinked() {
+    // `secret_get`'s real body (Task 8) has type `(i32, i32, i32) -> i32` (name_ptr, name_len,
+    // out_len_ptr -> ptr) -- the import declaration below must match it exactly or wasmtime's
+    // own instantiation-time type check fails the module, independent of capability grants.
     let wat = r#"
         (module
-            (import "pythia_host" "secret_get" (func $secret_get))
+            (import "pythia_host" "secret_get"
+                (func $secret_get (param i32 i32 i32) (result i32)))
             (func (export "noop") (result i32) i32.const 0))
     "#;
     let module_bytes = wat::parse_str(wat).expect("wat parses");

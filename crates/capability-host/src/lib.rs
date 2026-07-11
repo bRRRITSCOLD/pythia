@@ -8,8 +8,9 @@
 //! `Linker`, so a skill module that references it fails instantiation outright — denial is a
 //! structural absence, not a runtime check that could be skipped.
 //!
-//! `fs_read` has a real body as of Task 6 (`host_fns::fs`, SR-3's per-call scope re-check);
-//! `net_*_send`/`secret_get` remain placeholder import slots until Task 8.
+//! `fs_read` (Task 6, `host_fns::fs`, SR-3's per-call scope re-check) and `secret_get` (Task 8,
+//! `host_fns::secret`, SR-5's mandatory redaction) have real bodies; `net_*_send` remains a
+//! placeholder import slot until Task 7.
 //!
 //! It also owns SR-6 (fuel + memory/table limits, `limits.rs`): every `Store` carries an explicit
 //! fuel budget, a linear-memory ceiling, and a table-element ceiling (a module needs no capability
@@ -18,6 +19,7 @@
 //! the instance as a distinct `HostError::ResourceLimitExceeded` rather than hanging the kernel's
 //! single-threaded loop.
 
+mod execute;
 mod host_fns;
 mod limits;
 mod linker;
@@ -29,18 +31,22 @@ use pythia_manifest::{resolve, PolicyFile, ResolvedGrants, SkillManifest};
 use wasmtime::{Config, Engine, Module, Store, Trap, Val};
 use wasmtime_wasi::preview1::WasiP1Ctx;
 
+pub use execute::ExecutionResult;
+
 /// Negative sentinels shared across the wasm ABI boundary and this crate's own test suite (a
 /// separate crate, so it can only see `pub` items) -- see `host_fns::fs` for the values and how
 /// each is produced.
 pub use host_fns::fs::{BUFFER_TOO_SMALL, DENIED, IO_ERROR};
 
-/// Per-`Store` state: the WASI preview1 context, the resolved grants so host functions
-/// (e.g. `fs_read`) can re-check scope against the exact grant on every call rather than trust a
-/// decision cached at link time (SR-3), and the SR-6 memory-limit accounting.
+/// Per-`Store` state: the WASI preview1 context, the resolved grants (so a host function can
+/// re-check its exact grant on every call rather than trust a decision cached at link time --
+/// SR-3), the SR-6 memory-limit accounting, and the set of secret values handed out during this
+/// instance's lifetime (so `execute::build_execution_result` can redact every one of them -- SR-5).
 struct HostState {
     wasi: WasiP1Ctx,
     grants: ResolvedGrants,
     limits: limits::MemoryLimiter,
+    handed_out_secrets: Vec<host_fns::secret::HandedOutSecret>,
 }
 
 /// Everything that can go wrong standing up a skill sandbox.
@@ -195,6 +201,13 @@ impl Instance {
         }
         HostError::Wasmtime(err)
     }
+
+    /// Wraps `raw` (a skill's unredacted `run`-export bytes) as a redacted-by-construction
+    /// `ExecutionResult`, consuming this instance's handed-out-secrets record in the process
+    /// (SR-5) -- see `execute`'s module doc for why this is the only way to obtain one.
+    pub fn into_execution_result(self, raw: Vec<u8>) -> ExecutionResult {
+        execute::build_execution_result(raw, &self.store.into_data().handed_out_secrets)
+    }
 }
 
 /// Owns the wasmtime `Engine` (expensive to create, cheap to share) and instantiates skills into
@@ -261,6 +274,7 @@ impl CapabilityHost {
                     limits::MEMORY_LIMIT_BYTES,
                     limits::TABLE_ELEMENT_LIMIT,
                 ),
+                handed_out_secrets: Vec::new(),
             },
         );
         limits::configure_limits(&mut store).map_err(HostError::Wasmtime)?;
