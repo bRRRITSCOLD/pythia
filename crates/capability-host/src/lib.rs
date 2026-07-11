@@ -8,22 +8,25 @@
 //! `Linker`, so a skill module that references it fails instantiation outright — denial is a
 //! structural absence, not a runtime check that could be skipped.
 //!
-//! No host function has a real body in this task — `fs_read`/`net_*_send`/`secret_get` are
-//! placeholder import slots here; their bodies land in Tasks 6, 7, and 8.
+//! `fs_read` has a real body as of Task 6 (`host_fns::fs`, SR-3's per-call scope re-check);
+//! `net_*_send`/`secret_get` remain placeholder import slots until Tasks 7 and 8.
 
+mod host_fns;
 mod linker;
 mod wasi;
 
 use std::fmt;
 
-use pythia_manifest::{resolve, PolicyFile, SkillManifest};
+use pythia_manifest::{resolve, PolicyFile, ResolvedGrants, SkillManifest};
 use wasmtime::{Engine, Module, Store, Val};
 use wasmtime_wasi::preview1::WasiP1Ctx;
 
-/// Per-`Store` state: currently just the WASI preview1 context. Host functions land here as
-/// fields in Tasks 6/7/8 (e.g. secret store, fuel/memory accounting).
+/// Per-`Store` state: the WASI preview1 context, plus the resolved grants so host functions
+/// (e.g. `fs_read`) can re-check scope against the exact grant on every call rather than trust a
+/// decision cached at link time (SR-3).
 struct HostState {
     wasi: WasiP1Ctx,
+    grants: ResolvedGrants,
 }
 
 /// Everything that can go wrong standing up a skill sandbox.
@@ -92,6 +95,34 @@ impl Instance {
             ))),
         }
     }
+
+    /// Reads `len` bytes out of the instance's exported `memory` at `offset`. Used to retrieve
+    /// what a host function (e.g. `fs_read`) wrote back into guest linear memory.
+    pub fn read_memory(&mut self, offset: i32, len: i32) -> Result<Vec<u8>, HostError> {
+        let memory = self.memory()?;
+        let mut buf = vec![0u8; len.max(0) as usize];
+        memory
+            .read(&mut self.store, offset.max(0) as usize, &mut buf)
+            .map_err(|err| HostError::Wasmtime(anyhow::Error::from(err)))?;
+        Ok(buf)
+    }
+
+    /// Writes `bytes` into the instance's exported `memory` at `offset`. Used by callers/tests to
+    /// stage arguments (e.g. a path string) before invoking an exported function.
+    pub fn write_memory(&mut self, offset: i32, bytes: &[u8]) -> Result<(), HostError> {
+        let memory = self.memory()?;
+        memory
+            .write(&mut self.store, offset.max(0) as usize, bytes)
+            .map_err(|err| HostError::Wasmtime(anyhow::Error::from(err)))
+    }
+
+    fn memory(&mut self) -> Result<wasmtime::Memory, HostError> {
+        self.inner
+            .get_memory(&mut self.store, "memory")
+            .ok_or_else(|| {
+                HostError::Wasmtime(anyhow::anyhow!("instance has no exported `memory`"))
+            })
+    }
 }
 
 /// Owns the wasmtime `Engine` (expensive to create, cheap to share) and instantiates skills into
@@ -127,7 +158,13 @@ impl CapabilityHost {
         let linker = linker::build_linker(&self.engine, &grants).map_err(HostError::Wasmtime)?;
         let wasi_ctx = wasi::build_wasi_ctx(&grants).map_err(HostError::Wasmtime)?;
 
-        let mut store = Store::new(&self.engine, HostState { wasi: wasi_ctx });
+        let mut store = Store::new(
+            &self.engine,
+            HostState {
+                wasi: wasi_ctx,
+                grants,
+            },
+        );
 
         for import in module.imports() {
             if linker
