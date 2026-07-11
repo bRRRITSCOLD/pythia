@@ -135,16 +135,41 @@ impl Instance {
     /// Rejects negative `offset`/`len` with an error rather than silently clamping to `0`: a
     /// clamp would turn a caller bug (or a negative byte count returned by a host function) into
     /// a read from an unintended offset instead of a visible failure.
+    ///
+    /// Mirrors `host_fns::fs::read_guest_path`'s ceiling check: `offset`/`len` are proven to fall
+    /// within the instance's actual linear-memory size *before* the `len`-sized host buffer is
+    /// allocated, so a guest-controlled `len` up to `i32::MAX` can't force a multi-gigabyte
+    /// transient allocation ahead of a decision that was always going to reject the read.
     pub fn read_memory(&mut self, offset: i32, len: i32) -> Result<Vec<u8>, HostError> {
         if offset < 0 || len < 0 {
             return Err(HostError::Wasmtime(anyhow::anyhow!(
                 "read_memory: offset and len must be non-negative (offset={offset}, len={len})"
             )));
         }
+        let offset = offset as usize;
+        let len = len as usize;
+
         let memory = self.memory()?;
-        let mut buf = vec![0u8; len as usize];
+        let memory_size = memory.data_size(&mut self.store);
+        if len > memory_size {
+            return Err(HostError::Wasmtime(anyhow::anyhow!(
+                "read_memory: len {len} exceeds memory size {memory_size}"
+            )));
+        }
+        let end = offset.checked_add(len).ok_or_else(|| {
+            HostError::Wasmtime(anyhow::anyhow!(
+                "read_memory: offset {offset} + len {len} overflows"
+            ))
+        })?;
+        if end > memory_size {
+            return Err(HostError::Wasmtime(anyhow::anyhow!(
+                "read_memory: offset {offset} + len {len} exceeds memory size {memory_size}"
+            )));
+        }
+
+        let mut buf = vec![0u8; len];
         memory
-            .read(&mut self.store, offset as usize, &mut buf)
+            .read(&mut self.store, offset, &mut buf)
             .map_err(|err| HostError::Wasmtime(anyhow::Error::from(err)))?;
         Ok(buf)
     }
