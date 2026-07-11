@@ -1,0 +1,10 @@
+[package]
+name = "pythia-kernel"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+pythia-eventlog = { path = "../eventlog" }
+pythia-provider = { path = "../provider" }
+pythia-capability-host = { path = "../capability-host" }

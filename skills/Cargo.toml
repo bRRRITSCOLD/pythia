@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["skill-sdk", "read-file", "send-email"]
+
+[workspace.package]
+edition = "2021"
+publish = false
