@@ -9,16 +9,24 @@
 //! structural absence, not a runtime check that could be skipped.
 //!
 //! `fs_read` has a real body as of Task 6 (`host_fns::fs`, SR-3's per-call scope re-check);
-//! `net_*_send`/`secret_get` remain placeholder import slots until Tasks 7 and 8.
+//! `net_*_send`/`secret_get` remain placeholder import slots until Task 8.
+//!
+//! It also owns SR-6 (fuel + memory/table limits, `limits.rs`): every `Store` carries an explicit
+//! fuel budget, a linear-memory ceiling, and a table-element ceiling (a module needs no capability
+//! grant to declare its own internal table, so this is bounded independently of the capability
+//! system -- see `limits::TABLE_ELEMENT_LIMIT`), and exceeding any of the three force-terminates
+//! the instance as a distinct `HostError::ResourceLimitExceeded` rather than hanging the kernel's
+//! single-threaded loop.
 
 mod host_fns;
+mod limits;
 mod linker;
 mod wasi;
 
 use std::fmt;
 
 use pythia_manifest::{resolve, PolicyFile, ResolvedGrants, SkillManifest};
-use wasmtime::{Engine, Module, Store, Val};
+use wasmtime::{Config, Engine, Module, Store, Trap, Val};
 use wasmtime_wasi::preview1::WasiP1Ctx;
 
 /// Negative sentinels shared across the wasm ABI boundary and this crate's own test suite (a
@@ -26,12 +34,13 @@ use wasmtime_wasi::preview1::WasiP1Ctx;
 /// each is produced.
 pub use host_fns::fs::{BUFFER_TOO_SMALL, DENIED, IO_ERROR};
 
-/// Per-`Store` state: the WASI preview1 context, plus the resolved grants so host functions
+/// Per-`Store` state: the WASI preview1 context, the resolved grants so host functions
 /// (e.g. `fs_read`) can re-check scope against the exact grant on every call rather than trust a
-/// decision cached at link time (SR-3).
+/// decision cached at link time (SR-3), and the SR-6 memory-limit accounting.
 struct HostState {
     wasi: WasiP1Ctx,
     grants: ResolvedGrants,
+    limits: limits::MemoryLimiter,
 }
 
 /// Everything that can go wrong standing up a skill sandbox.
@@ -41,6 +50,10 @@ pub enum HostError {
     /// matching import slot in the `Linker` at all. This is SR-2's core mechanism: absent grant
     /// -> absent import -> instantiation fails, before any skill-specific host function runs.
     CapabilityDenied(String),
+    /// A skill instantiation exceeded its fuel budget or linear-memory ceiling (SR-6) and was
+    /// force-terminated. Kept distinct from `Wasmtime` so callers (Task 9/15) can map it to
+    /// `effect_result.status = "resource_limit_exceeded"`, never conflated with `"denied"`.
+    ResourceLimitExceeded(String),
     /// Any other wasmtime-level failure: malformed wasm bytes, a WASI context that failed to
     /// build (e.g. a granted `fs:read` path that doesn't exist on the host), or an instantiation
     /// failure not caused by a missing capability import.
@@ -53,6 +66,9 @@ impl fmt::Display for HostError {
             HostError::CapabilityDenied(import) => {
                 write!(f, "capability denied: import `{import}` was not granted")
             }
+            HostError::ResourceLimitExceeded(reason) => {
+                write!(f, "resource limit exceeded: {reason}")
+            }
             HostError::Wasmtime(err) => write!(f, "capability host error: {err}"),
         }
     }
@@ -62,6 +78,7 @@ impl std::error::Error for HostError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             HostError::CapabilityDenied(_) => None,
+            HostError::ResourceLimitExceeded(_) => None,
             HostError::Wasmtime(err) => Some(err.as_ref()),
         }
     }
@@ -90,8 +107,10 @@ impl Instance {
 
         let call_args: Vec<Val> = args.iter().map(|&v| Val::I32(v)).collect();
         let mut results = [Val::I32(0)];
-        func.call(&mut self.store, &call_args, &mut results)
-            .map_err(HostError::Wasmtime)?;
+        let call_result = func.call(&mut self.store, &call_args, &mut results);
+        if let Err(err) = call_result {
+            return Err(self.classify_call_error(err));
+        }
 
         match results.first() {
             Some(Val::I32(value)) => Ok(*value),
@@ -145,6 +164,37 @@ impl Instance {
                 HostError::Wasmtime(anyhow::anyhow!("instance has no exported `memory`"))
             })
     }
+
+    /// SR-6: turns a failed call into `HostError::ResourceLimitExceeded` when it was caused by
+    /// fuel exhaustion or one of the store's `MemoryLimiter` ceilings (linear memory or table
+    /// elements), rather than surfacing it as an opaque `HostError::Wasmtime`. Fuel exhaustion is
+    /// a well-known wasmtime trap code (`Trap::OutOfFuel`); the ceilings are this store's own
+    /// `MemoryLimiter`, so its `take_*_exceeded()` flags are checked directly rather than
+    /// pattern-matching trap text.
+    ///
+    /// Takes `&mut self` and *consumes* (take-and-resets) the limiter's flags rather than merely
+    /// reading them: an `Instance` is a single `Store` that a caller could technically keep
+    /// calling into after an error, and a plain read would let a stale `exceeded` flag from one
+    /// call misclassify an unrelated trap on a later call as the same resource-limit kill.
+    fn classify_call_error(&mut self, err: anyhow::Error) -> HostError {
+        if matches!(err.downcast_ref::<Trap>(), Some(Trap::OutOfFuel)) {
+            return HostError::ResourceLimitExceeded(
+                "fuel budget exhausted before the call completed".to_string(),
+            );
+        }
+        let limits = &mut self.store.data_mut().limits;
+        if limits.take_memory_exceeded() {
+            return HostError::ResourceLimitExceeded(
+                "linear memory ceiling exceeded before the call completed".to_string(),
+            );
+        }
+        if limits.take_table_exceeded() {
+            return HostError::ResourceLimitExceeded(
+                "table element ceiling exceeded before the call completed".to_string(),
+            );
+        }
+        HostError::Wasmtime(err)
+    }
 }
 
 /// Owns the wasmtime `Engine` (expensive to create, cheap to share) and instantiates skills into
@@ -155,9 +205,31 @@ pub struct CapabilityHost {
 
 impl CapabilityHost {
     pub fn new() -> Result<Self, HostError> {
-        Ok(CapabilityHost {
-            engine: Engine::default(),
-        })
+        // SR-6: fuel consumption must be enabled at the `Engine` (not `Store`) level for
+        // `Store::set_fuel` to have any effect -- see `limits::configure_limits`.
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        // SR-6: the `MemoryLimiter` memory ceiling is enforced per *linear memory* by wasmtime's
+        // `ResourceLimiter` callback. With multi-memory enabled a module can declare ~100 memories,
+        // each individually under the 16 MiB ceiling but aggregating to ~1.6 GiB of host RSS — a
+        // zero-capability host-OOM bypass of the intended per-Store ceiling. Restrict every skill
+        // module to a single linear memory so the per-memory check *is* the per-Store ceiling.
+        // (Tables can't aggregate the same way: each is capped at TABLE_ELEMENT_LIMIT elements, so
+        // even ~100 tables total < 8 MiB — not a host-OOM vector.)
+        config.wasm_multi_memory(false);
+        // SR-6 fuel-blind hang vector: the WebAssembly threads proposal (shared memories +
+        // atomic instructions) is enabled by wasmtime 36's default cargo features. A
+        // zero-capability skill needs no grant to declare `(memory 1 1 shared)` and execute
+        // `memory.atomic.wait32` -- the guest thread parks in the kernel, and fuel (which only
+        // decrements on executed instructions) never fires because no instruction is executing
+        // while parked. Every Pythia skill target is single-threaded wasm32-wasip1, which has no
+        // legitimate use for shared memory or atomics, so disable the whole proposal at
+        // validation time: a module declaring a shared memory or an atomic instruction now fails
+        // to instantiate instead of reaching a state where it can park the host thread forever.
+        config.wasm_threads(false);
+        let engine = Engine::new(&config).map_err(HostError::Wasmtime)?;
+
+        Ok(CapabilityHost { engine })
     }
 
     /// Resolves `manifest.requested` against `policy` (fail-closed — see
@@ -185,8 +257,13 @@ impl CapabilityHost {
             HostState {
                 wasi: wasi_ctx,
                 grants,
+                limits: limits::MemoryLimiter::new(
+                    limits::MEMORY_LIMIT_BYTES,
+                    limits::TABLE_ELEMENT_LIMIT,
+                ),
             },
         );
+        limits::configure_limits(&mut store).map_err(HostError::Wasmtime)?;
 
         for import in module.imports() {
             if linker
