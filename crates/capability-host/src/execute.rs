@@ -118,12 +118,71 @@ pub fn execute(
 fn result_for_host_error(err: HostError, tainted: bool) -> ExecutionResult {
     match err {
         HostError::CapabilityDenied(import) => denied(
-            format!("capability denied: import `{import}` was not granted"),
+            format!(
+                "capability denied: import `{}` was not granted",
+                sanitize_reason_fragment(&import)
+            ),
             tainted,
         ),
         HostError::ResourceLimitExceeded(reason) => resource_limit_exceeded(reason, tainted),
-        HostError::Wasmtime(err) => denied(format!("execution failed: {err}"), tainted),
+        HostError::Wasmtime(err) => denied(
+            format!(
+                "execution failed: {}",
+                sanitize_reason_fragment(&err.to_string())
+            ),
+            tainted,
+        ),
     }
+}
+
+/// The maximum length, in bytes, of a guest-derived fragment folded into a `Denied` reason
+/// string. Bounds the amount of guest-controlled text the kernel ends up persisting and
+/// rendering per denial -- a guest can pick an arbitrarily long import name or trigger an error
+/// whose `Display` output is unbounded, and without this cap that text flows straight into a
+/// public `ExecutionResult` (see module doc: `CapabilityDenied`/`Wasmtime` are the only two
+/// `HostError` variants that lift guest-controlled bytes into a reason string).
+const MAX_REASON_FRAGMENT: usize = 256;
+
+/// Marker appended when a guest-derived fragment is truncated for exceeding `MAX_REASON_FRAGMENT`.
+const TRUNCATION_MARKER: &str = "…(truncated)";
+
+/// Placeholder substituted for each control/non-printable byte a guest-derived fragment contains
+/// (anything below `0x20`, `0x7f` DEL, and the ANSI CSI introducer `ESC [`) so a malicious import
+/// name or error string can't inject terminal escape sequences or embedded newlines into a
+/// rendered/persisted reason string.
+const CONTROL_BYTE_PLACEHOLDER: &str = "\u{fffd}";
+
+/// Sanitizes a guest-controlled fragment before it is folded into a `Denied` reason string: caps
+/// its length (truncating with `TRUNCATION_MARKER`) and replaces control/non-printable bytes with
+/// a visible placeholder so guest-chosen bytes can never inject raw control sequences (e.g. ANSI
+/// CSI) or blow out the size of a persisted/rendered `ExecutionResult`. Fixed, host-authored
+/// prefixes ("capability denied: import …", "execution failed: …") are never passed through this
+/// function -- only the guest-derived fragment interpolated into them is.
+fn sanitize_reason_fragment(fragment: &str) -> String {
+    let truncated: String = fragment.chars().take(MAX_REASON_FRAGMENT).collect();
+    let was_truncated = fragment.chars().count() > MAX_REASON_FRAGMENT;
+
+    let mut sanitized = String::with_capacity(truncated.len());
+    let mut chars = truncated.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let is_control_or_del = (ch as u32) < 0x20 || ch == '\u{7f}';
+        let is_csi_introducer = ch == '\u{1b}' && chars.peek() == Some(&'[');
+        if is_control_or_del || is_csi_introducer {
+            sanitized.push_str(CONTROL_BYTE_PLACEHOLDER);
+            if is_csi_introducer {
+                // Consume the `[` too so the CSI introducer collapses to one placeholder rather
+                // than a placeholder followed by a literal `[`.
+                chars.next();
+            }
+        } else {
+            sanitized.push(ch);
+        }
+    }
+
+    if was_truncated {
+        sanitized.push_str(TRUNCATION_MARKER);
+    }
+    sanitized
 }
 
 fn denied(reason: String, tainted: bool) -> ExecutionResult {
@@ -270,6 +329,56 @@ mod tests {
 
         assert_eq!(result.status(), ExecutionStatus::Ok);
         assert_eq!(result.as_bytes(), raw.as_slice());
+    }
+
+    #[test]
+    fn Denied_GuestImportNameWithControlBytes_SanitizedInReason() {
+        let import = "evil\u{1b}[2Jmodule\n::\0name".to_string();
+
+        let result = result_for_host_error(HostError::CapabilityDenied(import), false);
+
+        assert_eq!(result.status(), ExecutionStatus::Denied);
+        let bytes = result.as_bytes();
+        assert!(
+            !contains_subslice(bytes, b"\x1b[2J"),
+            "expected raw ANSI CSI sequence to be absent, got {:?}",
+            String::from_utf8_lossy(bytes)
+        );
+        assert!(
+            !contains_subslice(bytes, b"\n"),
+            "expected raw newline to be absent, got {:?}",
+            String::from_utf8_lossy(bytes)
+        );
+        assert!(
+            !contains_subslice(bytes, b"\0"),
+            "expected raw NUL byte to be absent, got {:?}",
+            String::from_utf8_lossy(bytes)
+        );
+        assert!(
+            contains_subslice(bytes, CONTROL_BYTE_PLACEHOLDER.as_bytes()),
+            "expected a visible placeholder for the stripped control bytes, got {:?}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+
+    #[test]
+    fn Denied_OversizedGuestReason_LengthBounded() {
+        let import = "a".repeat(MAX_REASON_FRAGMENT * 4);
+
+        let result = result_for_host_error(HostError::CapabilityDenied(import), false);
+
+        assert_eq!(result.status(), ExecutionStatus::Denied);
+        let bytes = result.as_bytes();
+        assert!(
+            bytes.len() < MAX_REASON_FRAGMENT * 4,
+            "expected the oversized guest fragment to be truncated, got length {}",
+            bytes.len()
+        );
+        assert!(
+            contains_subslice(bytes, TRUNCATION_MARKER.as_bytes()),
+            "expected the truncation marker to be present, got {:?}",
+            String::from_utf8_lossy(bytes)
+        );
     }
 
     #[test]
