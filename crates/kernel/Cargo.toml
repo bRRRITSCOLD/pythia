@@ -8,3 +8,6 @@ publish.workspace = true
 pythia-eventlog = { path = "../eventlog" }
 pythia-provider = { path = "../provider" }
 pythia-capability-host = { path = "../capability-host" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
