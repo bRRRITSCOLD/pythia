@@ -9,7 +9,6 @@ mod schema;
 
 use std::fmt;
 use std::path::Path;
-use std::str::FromStr;
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -21,8 +20,8 @@ use rusqlite::{Connection, OptionalExtension};
 pub enum EventLogError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("unknown turn status: {0}")]
-    UnknownTurnStatus(String),
+    #[error("turn {0} is not open (already closed, or does not exist)")]
+    TurnNotOpen(String),
 }
 
 pub type Result<T> = std::result::Result<T, EventLogError>;
@@ -61,45 +60,31 @@ impl From<String> for TurnId {
     }
 }
 
-/// `turns.status` — mutated exactly twice per lifecycle: open (implicit on `open_turn`), then
-/// closed (`complete` or `aborted`) via `close_turn`.
+/// The two terminal outcomes a turn can be closed with. Deliberately excludes "open" — `Open` is
+/// not a valid argument to `close_turn`, and modeling that as a narrower type (rather than
+/// rejecting it at runtime from a three-variant `TurnStatus`) makes the invalid state
+/// unrepresentable instead of a reachable panic in the public API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnStatus {
-    Open,
+pub enum TurnOutcome {
     Complete,
     Aborted,
 }
 
-impl TurnStatus {
+impl TurnOutcome {
     fn as_db_str(self) -> &'static str {
         match self {
-            TurnStatus::Open => "open",
-            TurnStatus::Complete => "complete",
-            TurnStatus::Aborted => "aborted",
+            TurnOutcome::Complete => "complete",
+            TurnOutcome::Aborted => "aborted",
         }
     }
 
-    /// The terminal event `type` that must accompany this status when closing a turn — derived,
+    /// The terminal event `type` that must accompany this outcome when closing a turn — derived,
     /// not caller-supplied, so the two can never disagree (data model §6: `turns.status` must
     /// never diverge from the presence of its terminal event).
     fn terminal_event_type(self) -> &'static str {
         match self {
-            TurnStatus::Open => unreachable!("open is not a terminal status"),
-            TurnStatus::Complete => "TurnComplete",
-            TurnStatus::Aborted => "TurnAborted",
-        }
-    }
-}
-
-impl FromStr for TurnStatus {
-    type Err = EventLogError;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "open" => Ok(TurnStatus::Open),
-            "complete" => Ok(TurnStatus::Complete),
-            "aborted" => Ok(TurnStatus::Aborted),
-            other => Err(EventLogError::UnknownTurnStatus(other.to_string())),
+            TurnOutcome::Complete => "TurnComplete",
+            TurnOutcome::Aborted => "TurnAborted",
         }
     }
 }
@@ -115,6 +100,17 @@ pub struct EventRow {
     pub effect_result: Option<String>,
     pub tainted: bool,
     pub created: String,
+}
+
+/// The fields needed to append an interior event. A small borrowed struct instead of positional
+/// parameters — `seq` and `created` are DB-assigned, so this intentionally isn't the full
+/// `EventRow`, but the named fields keep call sites self-describing (no bare `None, false`).
+#[derive(Debug, Clone, Copy)]
+pub struct NewEvent<'a> {
+    pub event_type: &'a str,
+    pub payload_json: &'a str,
+    pub effect_result: Option<&'a str>,
+    pub tainted: bool,
 }
 
 /// The append-only envelope store. One `EventLog` per SQLite file; the kernel holds the single
@@ -141,6 +137,10 @@ impl EventLog {
 
     /// Open a new turn: insert the `turns` row and its opening `UserCommand` event in one atomic
     /// transaction (data model §6 — a turn must never exist with one but not the other).
+    ///
+    /// This does not itself enforce "at most one open turn" (the `idx_turns_open` partial index
+    /// is intentionally non-unique — see the locked DDL). The caller is the single writer and
+    /// owns that invariant, e.g. via `find_open_turn` before calling this.
     pub fn open_turn(&mut self, user_command_payload_json: &str, tainted: bool) -> Result<TurnId> {
         let turn_id = TurnId::new();
         let tx = self.conn.transaction()?;
@@ -159,23 +159,16 @@ impl EventLog {
     /// Append a single event row. Single-row autocommit — every interior event is its own durable
     /// transaction (data model §6: the crash-resume guarantee depends on nothing batching two
     /// events into one commit). Returns the assigned monotonic `seq`.
-    pub fn append(
-        &self,
-        turn_id: &TurnId,
-        event_type: &str,
-        payload_json: &str,
-        effect_result: Option<&str>,
-        tainted: bool,
-    ) -> Result<i64> {
+    pub fn append(&self, turn_id: &TurnId, event: NewEvent<'_>) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO events (turn_id, type, payload_json, effect_result, tainted) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             (
                 turn_id.as_str(),
-                event_type,
-                payload_json,
-                effect_result,
-                tainted as i64,
+                event.event_type,
+                event.payload_json,
+                event.effect_result,
+                event.tainted as i64,
             ),
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -208,23 +201,35 @@ impl EventLog {
     }
 
     /// Close a turn: update `turns.status`/`ended` and insert the terminal event, atomically
-    /// (data model §6). The terminal event type is derived from `status` so the two can never
+    /// (data model §6). The terminal event type is derived from `outcome` so the two can never
     /// disagree.
+    ///
+    /// The `UPDATE` is conditioned on `status = 'open'` and rolled back if it affects no row —
+    /// closing an already-closed (or nonexistent) turn is rejected with `TurnNotOpen` rather than
+    /// silently rewriting `status`/`ended` and appending a second, contradictory terminal event.
     pub fn close_turn(
         &mut self,
         turn_id: &TurnId,
-        status: TurnStatus,
+        outcome: TurnOutcome,
         payload_json: &str,
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute(
+        let updated = tx.execute(
             "UPDATE turns SET status = ?1, ended = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-             WHERE turn_id = ?2",
-            (status.as_db_str(), turn_id.as_str()),
+             WHERE turn_id = ?2 AND status = 'open'",
+            (outcome.as_db_str(), turn_id.as_str()),
         )?;
+        if updated != 1 {
+            // Transaction drops (and rolls back) here without committing.
+            return Err(EventLogError::TurnNotOpen(turn_id.as_str().to_string()));
+        }
         tx.execute(
             "INSERT INTO events (turn_id, type, payload_json) VALUES (?1, ?2, ?3)",
-            (turn_id.as_str(), status.terminal_event_type(), payload_json),
+            (
+                turn_id.as_str(),
+                outcome.terminal_event_type(),
+                payload_json,
+            ),
         )?;
         tx.commit()?;
         Ok(())
@@ -274,19 +279,23 @@ mod tests {
         let seq1 = log
             .append(
                 &turn_id,
-                "LlmResponse",
-                r#"{"text":"thinking"}"#,
-                None,
-                false,
+                NewEvent {
+                    event_type: "LlmResponse",
+                    payload_json: r#"{"text":"thinking"}"#,
+                    effect_result: None,
+                    tainted: false,
+                },
             )
             .unwrap();
         let seq2 = log
             .append(
                 &turn_id,
-                "ToolResult",
-                r#"{"tool":"read_file"}"#,
-                Some(r#"{"status":"ok"}"#),
-                false,
+                NewEvent {
+                    event_type: "ToolResult",
+                    payload_json: r#"{"tool":"read_file"}"#,
+                    effect_result: Some(r#"{"status":"ok"}"#),
+                    tainted: false,
+                },
             )
             .unwrap();
 
@@ -300,10 +309,12 @@ mod tests {
 
         let result = log.append(
             &turn_id,
-            "ToolResult",
-            r#"{"tool":"read_file"}"#,
-            None,
-            false,
+            NewEvent {
+                event_type: "ToolResult",
+                payload_json: r#"{"tool":"read_file"}"#,
+                effect_result: None,
+                tainted: false,
+            },
         );
 
         assert!(matches!(result, Err(EventLogError::Sqlite(_))));
@@ -316,10 +327,12 @@ mod tests {
 
         let result = log.append(
             &turn_id,
-            "LlmResponse",
-            r#"{"text":"hi"}"#,
-            Some(r#"{"status":"ok"}"#),
-            false,
+            NewEvent {
+                event_type: "LlmResponse",
+                payload_json: r#"{"text":"hi"}"#,
+                effect_result: Some(r#"{"status":"ok"}"#),
+                tainted: false,
+            },
         );
 
         assert!(matches!(result, Err(EventLogError::Sqlite(_))));
@@ -354,14 +367,24 @@ mod tests {
     fn read_turn_returns_rows_ordered_by_seq_matches_idx_events_turn_seq() {
         let mut log = open_log();
         let turn_id = log.open_turn(r#"{"text":"hi"}"#, false).unwrap();
-        log.append(&turn_id, "LlmResponse", r#"{"text":"a"}"#, None, false)
-            .unwrap();
         log.append(
             &turn_id,
-            "ToolResult",
-            r#"{"tool":"read_file"}"#,
-            Some(r#"{"status":"ok"}"#),
-            false,
+            NewEvent {
+                event_type: "LlmResponse",
+                payload_json: r#"{"text":"a"}"#,
+                effect_result: None,
+                tainted: false,
+            },
+        )
+        .unwrap();
+        log.append(
+            &turn_id,
+            NewEvent {
+                event_type: "ToolResult",
+                payload_json: r#"{"tool":"read_file"}"#,
+                effect_result: Some(r#"{"status":"ok"}"#),
+                tainted: false,
+            },
         )
         .unwrap();
 
@@ -394,7 +417,7 @@ mod tests {
         let mut log = open_log();
         let turn_id = log.open_turn(r#"{"text":"hi"}"#, false).unwrap();
 
-        log.close_turn(&turn_id, TurnStatus::Complete, "{}")
+        log.close_turn(&turn_id, TurnOutcome::Complete, "{}")
             .unwrap();
 
         assert_eq!(log.find_open_turn().unwrap(), None);
@@ -426,11 +449,40 @@ mod tests {
         let mut log = open_log();
         let turn_id = log.open_turn(r#"{"text":"hi"}"#, false).unwrap();
 
-        log.close_turn(&turn_id, TurnStatus::Aborted, r#"{"reason":"crash"}"#)
+        log.close_turn(&turn_id, TurnOutcome::Aborted, r#"{"reason":"crash"}"#)
             .unwrap();
 
         let events = log.read_turn(&turn_id).unwrap();
         assert_eq!(events.last().unwrap().event_type, "TurnAborted");
+    }
+
+    #[test]
+    fn close_turn_already_closed_turn_rejected_without_second_terminal_event() {
+        let mut log = open_log();
+        let turn_id = log.open_turn(r#"{"text":"hi"}"#, false).unwrap();
+        log.close_turn(&turn_id, TurnOutcome::Complete, "{}")
+            .unwrap();
+
+        let result = log.close_turn(&turn_id, TurnOutcome::Aborted, r#"{"reason":"double"}"#);
+
+        assert!(matches!(result, Err(EventLogError::TurnNotOpen(id)) if id == turn_id.as_str()));
+
+        let status: String = log
+            .conn
+            .query_row(
+                "SELECT status FROM turns WHERE turn_id = ?1",
+                (turn_id.as_str(),),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "complete");
+
+        let events = log.read_turn(&turn_id).unwrap();
+        let terminal_count = events
+            .iter()
+            .filter(|e| e.event_type == "TurnComplete" || e.event_type == "TurnAborted")
+            .count();
+        assert_eq!(terminal_count, 1);
     }
 
     #[test]
@@ -440,7 +492,7 @@ mod tests {
 
         let mut log1 = EventLog::open(&path).unwrap();
         let turn_id = log1.open_turn(r#"{"text":"hi"}"#, false).unwrap();
-        log1.close_turn(&turn_id, TurnStatus::Complete, "{}")
+        log1.close_turn(&turn_id, TurnOutcome::Complete, "{}")
             .unwrap();
         drop(log1);
 
