@@ -21,6 +21,11 @@ use pythia_manifest::{resolve, PolicyFile, ResolvedGrants, SkillManifest};
 use wasmtime::{Engine, Module, Store, Val};
 use wasmtime_wasi::preview1::WasiP1Ctx;
 
+/// Negative sentinels shared across the wasm ABI boundary and this crate's own test suite (a
+/// separate crate, so it can only see `pub` items) -- see `host_fns::fs` for the values and how
+/// each is produced.
+pub use host_fns::fs::{BUFFER_TOO_SMALL, DENIED, IO_ERROR};
+
 /// Per-`Store` state: the WASI preview1 context, plus the resolved grants so host functions
 /// (e.g. `fs_read`) can re-check scope against the exact grant on every call rather than trust a
 /// decision cached at link time (SR-3).
@@ -98,21 +103,38 @@ impl Instance {
 
     /// Reads `len` bytes out of the instance's exported `memory` at `offset`. Used to retrieve
     /// what a host function (e.g. `fs_read`) wrote back into guest linear memory.
+    ///
+    /// Rejects negative `offset`/`len` with an error rather than silently clamping to `0`: a
+    /// clamp would turn a caller bug (or a negative byte count returned by a host function) into
+    /// a read from an unintended offset instead of a visible failure.
     pub fn read_memory(&mut self, offset: i32, len: i32) -> Result<Vec<u8>, HostError> {
+        if offset < 0 || len < 0 {
+            return Err(HostError::Wasmtime(anyhow::anyhow!(
+                "read_memory: offset and len must be non-negative (offset={offset}, len={len})"
+            )));
+        }
         let memory = self.memory()?;
-        let mut buf = vec![0u8; len.max(0) as usize];
+        let mut buf = vec![0u8; len as usize];
         memory
-            .read(&mut self.store, offset.max(0) as usize, &mut buf)
+            .read(&mut self.store, offset as usize, &mut buf)
             .map_err(|err| HostError::Wasmtime(anyhow::Error::from(err)))?;
         Ok(buf)
     }
 
     /// Writes `bytes` into the instance's exported `memory` at `offset`. Used by callers/tests to
     /// stage arguments (e.g. a path string) before invoking an exported function.
+    ///
+    /// Rejects a negative `offset` with an error rather than silently clamping to `0` (see
+    /// `read_memory`).
     pub fn write_memory(&mut self, offset: i32, bytes: &[u8]) -> Result<(), HostError> {
+        if offset < 0 {
+            return Err(HostError::Wasmtime(anyhow::anyhow!(
+                "write_memory: offset must be non-negative (offset={offset})"
+            )));
+        }
         let memory = self.memory()?;
         memory
-            .write(&mut self.store, offset.max(0) as usize, bytes)
+            .write(&mut self.store, offset as usize, bytes)
             .map_err(|err| HostError::Wasmtime(anyhow::Error::from(err)))
     }
 
