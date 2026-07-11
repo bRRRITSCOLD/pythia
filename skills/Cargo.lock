@@ -52,6 +52,7 @@ name = "pythia-skill-sdk"
 version = "0.1.0"
 dependencies = [
  "pythia-manifest",
+ "toml",
 ]
 
 [[package]]

@@ -6,3 +6,4 @@ publish.workspace = true
 
 [dependencies]
 pythia-manifest = { path = "../../crates/manifest" }
+toml = "0.8"

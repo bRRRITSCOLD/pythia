@@ -8,6 +8,8 @@ mod manifest;
 mod policy;
 mod resolve;
 
+pub mod host_fn;
+
 pub use capability::{Capability, CapabilityParseError};
 pub use manifest::SkillManifest;
 pub use policy::{Decision, PolicyFile};
