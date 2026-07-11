@@ -3,6 +3,21 @@ name = "pythia-provider"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+pythia-provider = { path = ".", features = ["test-util"] }
+
+[features]
+# Exposes MockProvider and the reusable contract-test suite so downstream
+# crates (pythia-provider-ollama, pythia-kernel) can depend on this crate
+# with `features = ["test-util"]` in their own [dev-dependencies] without
+# shipping test-only code in production builds.
+test-util = []
