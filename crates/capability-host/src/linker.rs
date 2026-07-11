@@ -105,7 +105,11 @@ fn import_name_for(capability: &Capability) -> Option<String> {
 /// import" for every real skill (issue #32).
 fn register_import(linker: &mut Linker<HostState>, import_name: &str) -> Result<()> {
     if import_name == host_fn::FS_READ {
-        linker.func_wrap(host_fn::WASM_IMPORT_MODULE, import_name, host_fns::fs::fs_read)?;
+        linker.func_wrap(
+            host_fn::WASM_IMPORT_MODULE,
+            import_name,
+            host_fns::fs::fs_read,
+        )?;
     } else if import_name == host_fn::SECRET_GET {
         linker.func_wrap(
             host_fn::WASM_IMPORT_MODULE,
