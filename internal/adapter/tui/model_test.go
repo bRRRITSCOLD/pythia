@@ -78,6 +78,53 @@ func TestModel_ErrorMsg_ShowsErrorAndStaysUsable(t *testing.T) {
 	}
 }
 
+// TestModel_ErrorMsg_SanitizesErrorInView verifies that an EventError whose
+// message embeds a terminal escape sequence (e.g. an OSC-52 clipboard-write
+// payload smuggled through a provider or tool error string) is sanitized
+// (SR-1) before reaching View() — closing the gap where every other
+// untrusted channel was sanitized except errors.
+func TestModel_ErrorMsg_SanitizesErrorInView(t *testing.T) {
+	m := newTestModel()
+	ch := make(chan core.AgentEvent)
+	wantErr := errors.New("provider said \x1b]52;c;ZXZpbA==\x07 boom")
+
+	next, _ := m.handleAgentEvent(agentEventMsg{
+		event: core.AgentEvent{Type: core.EventError, Err: wantErr},
+		ch:    ch,
+	})
+	m = next.(Model)
+
+	view := m.View()
+	if strings.Contains(view, "\x1b") {
+		t.Errorf("View() = %q, contains unsanitized escape byte from error message", view)
+	}
+	if !strings.Contains(view, "boom") {
+		t.Errorf("View() = %q, want it to still contain the error text", view)
+	}
+}
+
+// TestModel_AgentChannelMsg_SanitizesErrorInStatus verifies that a failure
+// from Agent.Send itself (agentChannelMsg.err) is sanitized (SR-1) before
+// being written into the status line, mirroring the EventError fix — the
+// second untrusted-error code path in Update.
+func TestModel_AgentChannelMsg_SanitizesErrorInStatus(t *testing.T) {
+	m := newTestModel()
+	wantErr := errors.New("dial failed \x1b]52;c;ZXZpbA==\x07 refused")
+
+	next, cmd := m.Update(agentChannelMsg{err: wantErr})
+	m = next.(Model)
+
+	if strings.Contains(m.status, "\x1b") {
+		t.Errorf("status = %q, contains unsanitized escape byte from Send error", m.status)
+	}
+	if !strings.Contains(m.status, "refused") {
+		t.Errorf("status = %q, want it to still contain the error text", m.status)
+	}
+	if cmd != nil {
+		t.Errorf("cmd = non-nil after Agent.Send error, want nil")
+	}
+}
+
 // TestModel_ToolCallStartedMsg_ShowsToolActivity verifies that an
 // EventToolCallStarted updates the status line with the (sanitized) tool
 // name so the user sees activity while a tool runs.

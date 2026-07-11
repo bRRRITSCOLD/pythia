@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -60,6 +61,8 @@ type Model struct {
 	err    error  // last EventError, if any; TUI stays usable (NFR)
 
 	ready bool // WindowSizeMsg received; viewport/input sized
+
+	cancel context.CancelFunc // cancels the in-flight turn's context, if any
 }
 
 // NewModel builds a TUI Model bound to a (agent) and a specific sessionID.
@@ -104,8 +107,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case agentChannelMsg:
 		if msg.err != nil {
 			m.err = msg.err
-			m.status = "error: " + msg.err.Error()
+			m.status = "error: " + Sanitize(msg.err.Error())
 			m.busy = false
+			if m.cancel != nil {
+				m.cancel()
+				m.cancel = nil
+			}
 			return m, nil
 		}
 		return m, listenForAgentEvent(msg.ch)
@@ -127,7 +134,7 @@ func (m Model) View() string {
 
 	status := statusStyle.Render(m.status)
 	if m.err != nil {
-		status = errorStyle.Render("error: " + m.err.Error())
+		status = errorStyle.Render("error: " + Sanitize(m.err.Error()))
 	}
 
 	return fmt.Sprintf("%s\n%s\n%s", m.viewport.View(), status, m.input.View())
@@ -155,6 +162,9 @@ func (m Model) resize(msg tea.WindowSizeMsg) Model {
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlC, tea.KeyEsc:
+		if m.cancel != nil {
+			m.cancel()
+		}
 		return m, tea.Quit
 
 	case tea.KeyEnter:
@@ -182,10 +192,13 @@ func (m Model) submit(text string) (tea.Model, tea.Cmd) {
 	m.err = nil
 	m.status = "thinking..."
 
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel = cancel
+
 	agent := m.agent
 	sessionID := m.sessionID
 	return m, func() tea.Msg {
-		ch, err := agent.Send(context.Background(), sessionID, text)
+		ch, err := agent.Send(ctx, sessionID, text)
 		return agentChannelMsg{ch: ch, err: err}
 	}
 }
@@ -213,6 +226,10 @@ func listenForAgentEvent(ch <-chan core.AgentEvent) tea.Cmd {
 func (m Model) handleAgentEvent(msg agentEventMsg) (tea.Model, tea.Cmd) {
 	if msg.closed {
 		m.busy = false
+		if m.cancel != nil {
+			m.cancel()
+			m.cancel = nil
+		}
 		return m, nil
 	}
 
@@ -235,12 +252,20 @@ func (m Model) handleAgentEvent(msg agentEventMsg) (tea.Model, tea.Cmd) {
 	case core.EventTurnComplete:
 		m.busy = false
 		m.status = "ready"
+		if m.cancel != nil {
+			m.cancel()
+			m.cancel = nil
+		}
 		return m, nil
 
 	case core.EventError:
 		m.busy = false
 		m.err = msg.event.Err
 		m.status = "error"
+		if m.cancel != nil {
+			m.cancel()
+			m.cancel = nil
+		}
 		return m, nil
 	}
 
@@ -268,9 +293,11 @@ func formatToolResult(raw json.RawMessage) string {
 	if err := json.Unmarshal(raw, &pretty); err != nil {
 		return string(raw)
 	}
-	out, err := json.Marshal(pretty)
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(pretty); err != nil {
 		return string(raw)
 	}
-	return string(out)
+	return strings.TrimRight(buf.String(), "\n")
 }
