@@ -62,12 +62,15 @@ func TestCoreImportsOnlyStdlib(t *testing.T) {
 				t.Errorf("%s imports adapter %q", pkg.ImportPath, imp)
 				continue
 			}
-			if isThirdParty(imp) {
-				t.Errorf("%s imports third-party %q", pkg.ImportPath, imp)
-				continue
-			}
+			// Check in-module BEFORE isThirdParty: module-internal paths also
+			// start with a dotted first segment (github.com/...), so isThirdParty
+			// would report them as third-party and this branch would be dead.
 			if strings.HasPrefix(imp, module+"/") {
 				t.Errorf("%s imports disallowed in-module package %q", pkg.ImportPath, imp)
+				continue
+			}
+			if isThirdParty(imp) {
+				t.Errorf("%s imports third-party %q", pkg.ImportPath, imp)
 			}
 		}
 	}
