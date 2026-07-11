@@ -10,6 +10,15 @@ path = "src/main.rs"
 
 [dependencies]
 pythia-kernel = { path = "../kernel" }
+pythia-provider = { path = "../provider" }
 pythia-provider-ollama = { path = "../provider-ollama" }
 pythia-capability-host = { path = "../capability-host" }
 pythia-eventlog = { path = "../eventlog" }
+pythia-manifest = { path = "../manifest" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+toml = "0.8"
+
+[dev-dependencies]
+pythia-provider = { path = "../provider", features = ["test-util"] }
+tempfile = "3"
