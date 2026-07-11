@@ -29,6 +29,13 @@ pub fn build_manifest_toml(name: &str, requested: &[&str]) -> Result<String, Cap
 /// manifest declaration is fixed at compile time, so this is a programmer error, not runtime
 /// input to handle gracefully.
 ///
+/// `skill_manifest_toml()` is a plain function, not a `#[no_mangle]` export or a build-time
+/// artifact — how the host obtains a compiled skill's manifest *before* instantiating it (i.e.
+/// without running the wasm module) is still open and deferred to Task 12. Whatever that
+/// mechanism turns out to be (a build-script-emitted sidecar file, a `#[no_mangle]` export the
+/// host calls post-instantiation, etc.), it should call this function rather than re-deriving
+/// the TOML shape.
+///
 /// ```ignore
 /// pythia_skill_sdk::declare_manifest! {
 ///     name: "read-file",

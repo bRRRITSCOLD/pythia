@@ -2,12 +2,14 @@
 //!
 //! A skill's `run` export hands its result back to the host as raw bytes; the capability
 //! host's `execute()` (Task 9) is the reader on the other end. The shape is a one-byte tag
-//! followed by the payload: `0x00` + arbitrary bytes for success, `0x01` + a UTF-8 message for
-//! failure. Kept intentionally minimal — no length prefix needed, since the host already knows
-//! the total byte count from the wasm call's return.
+//! followed by the payload: `pythia_manifest::host_fn::RESULT_TAG_OK` + arbitrary bytes for
+//! success, `RESULT_TAG_ERR` + a UTF-8 message for failure. Kept intentionally minimal — no
+//! length prefix needed, since the host already knows the total byte count from the wasm call's
+//! return. The tag bytes themselves live in `pythia-manifest::host_fn` (not here, and not
+//! re-derived by the host's decoder) — the same shared-constants pattern this crate's `imports`
+//! module uses for host function names, so the two workspaces can't drift apart silently.
 
-const TAG_OK: u8 = 0x00;
-const TAG_ERR: u8 = 0x01;
+use pythia_manifest::host_fn::{RESULT_TAG_ERR as TAG_ERR, RESULT_TAG_OK as TAG_OK};
 
 /// A decoded skill result, the inverse of `ok_result`/`err_result`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,5 +80,12 @@ mod tests {
     #[test]
     fn DecodeResult_UnknownTag_ReturnsNoneNotPanic() {
         assert_eq!(decode_result(&[0xFF, 1, 2, 3]), None);
+    }
+
+    #[test]
+    fn DecodeResult_ErrTagInvalidUtf8_ReturnsNone() {
+        let invalid_utf8 = [TAG_ERR, 0xFF, 0xFE];
+
+        assert_eq!(decode_result(&invalid_utf8), None);
     }
 }

@@ -17,3 +17,12 @@ pub const NET_SMTP_SEND: &str = "net_smtp_send";
 
 /// Resolves a granted secret by name. Backs `secret:<name>` capabilities.
 pub const SECRET_GET: &str = "secret_get";
+
+/// A skill's `run` export hands its result back to the host as raw bytes: a one-byte tag
+/// followed by the payload. `pythia-skill-sdk` (Task 11) is the encoder; `pythia-capability-host`'s
+/// `execute()` (Task 9) is the decoder. Defined here, not in either workspace, so the two sides
+/// can't drift apart the way the import names above already can't.
+pub const RESULT_TAG_OK: u8 = 0x00;
+
+/// Tag byte for a failed skill result: followed by a UTF-8 error message.
+pub const RESULT_TAG_ERR: u8 = 0x01;
