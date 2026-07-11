@@ -1462,7 +1462,13 @@ dependencies = [
  "pythia-capability-host",
  "pythia-eventlog",
  "pythia-kernel",
+ "pythia-manifest",
+ "pythia-provider",
  "pythia-provider-ollama",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
