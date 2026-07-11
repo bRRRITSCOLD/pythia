@@ -80,19 +80,6 @@ pub(crate) fn build_linker(engine: &Engine, grants: &ResolvedGrants) -> Result<L
     Ok(linker)
 }
 
-/// Registers the real host function body for capabilities that have one (`secret_get`, Task 8),
-/// or the placeholder for the rest (`fs_read`, `net_*_send` — Tasks 6/7). Every branch still
-/// registers *an* import slot for a granted capability; which body runs is the only thing that
-/// changes per task.
-fn register_import(linker: &mut Linker<HostState>, import_name: &str) -> Result<()> {
-    if import_name == host_fn::SECRET_GET {
-        linker.func_wrap(HOST_MODULE, import_name, host_fns::secret::secret_get)?;
-    } else {
-        linker.func_wrap(HOST_MODULE, import_name, placeholder)?;
-    }
-    Ok(())
-}
-
 /// Maps a granted capability to the import name a skill would use to call it. Distinct
 /// capabilities of the same kind (e.g. two `fs:read` grants for different paths) share one
 /// import slot — the per-call scope re-check (Task 6) is what actually distinguishes them, not
