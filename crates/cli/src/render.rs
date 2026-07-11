@@ -11,16 +11,105 @@ use std::io::{self, Write};
 
 use pythia_kernel::{KernelEvent, TurnOutcome};
 
+/// Visible placeholder substituted for each stripped control/ANSI sequence. Chosen to be
+/// unambiguous in a terminal (not itself a control character) and to make the fact of
+/// stripping visible to the operator rather than silently disappearing.
+const STRIPPED_PLACEHOLDER: &str = "\u{2426}"; // "SYMBOL FOR SUBSTITUTE" (␦-ish, printable)
+
+/// Strips C0 control characters (except `\n`/`\t`, which are legitimate output formatting),
+/// `0x7f` (DEL), and ANSI escape sequences (CSI `ESC [ ... final-byte` and OSC
+/// `ESC ] ... (BEL | ESC \\)`) from `s`, replacing each stripped run with
+/// [`STRIPPED_PLACEHOLDER`].
+///
+/// This is the SR-17 terminal-injection guard (`docs/superpowers/security/pythia-threat-model.md`):
+/// tainted content (LLM output, tool output) can carry escape sequences that rewrite the
+/// operator's terminal (clear screen, move the cursor, spoof a fake prompt). Applying this
+/// before tainted text reaches stdout removes that capability while leaving ordinary printable
+/// text — including the `<redacted:secret:...>` marker, which is plain ASCII — untouched.
+fn sanitize_for_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut stripped_pending = false;
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' | '\t' => {
+                stripped_pending = false;
+                out.push(c);
+            }
+            '\u{1b}' => {
+                // ESC: consume a CSI (`[ ... final-byte`) or OSC (`] ... BEL|ESC \`) sequence,
+                // or any other single escaped character, entirely.
+                match chars.peek() {
+                    Some('[') => {
+                        chars.next();
+                        for c2 in chars.by_ref() {
+                            if ('\u{40}'..='\u{7e}').contains(&c2) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        chars.next();
+                        loop {
+                            match chars.next() {
+                                None | Some('\u{7}') => break,
+                                Some('\u{1b}') if chars.peek() == Some(&'\\') => {
+                                    chars.next();
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        chars.next();
+                    }
+                    None => {}
+                }
+                if !stripped_pending {
+                    out.push_str(STRIPPED_PLACEHOLDER);
+                    stripped_pending = true;
+                }
+            }
+            c if c == '\u{7f}' || (c < '\u{20}') => {
+                if !stripped_pending {
+                    out.push_str(STRIPPED_PLACEHOLDER);
+                    stripped_pending = true;
+                }
+            }
+            c => {
+                stripped_pending = false;
+                out.push(c);
+            }
+        }
+    }
+
+    out
+}
+
 /// Renders one journalled event as a line (or a few) of human-readable stdout output.
 /// `output`/`text` fields are written with the standard library's `Display` formatting only —
-/// no parsing, no substring scanning, no "helpful" substitution of any marker found inside them.
+/// no parsing, no substring scanning, no "helpful" substitution of any marker found inside them —
+/// except that content whose `tainted` flag is set is first passed through
+/// [`sanitize_for_terminal`] to strip control/ANSI escape sequences (SR-17). Untainted,
+/// kernel-authored content (e.g. the `> {text}` echo of what the operator just typed) renders
+/// verbatim: it did not originate from an untrusted source, so there is nothing to sanitize
+/// against.
 pub fn render_event(event: &KernelEvent, out: &mut impl Write) -> io::Result<()> {
     match event {
         KernelEvent::UserCommand { text, .. } => writeln!(out, "> {text}"),
         KernelEvent::LlmResponse {
-            text, tool_call, ..
+            text,
+            tool_call,
+            tainted,
         } => {
             if !text.is_empty() {
+                let text = if *tainted {
+                    sanitize_for_terminal(text)
+                } else {
+                    text.clone()
+                };
                 writeln!(out, "{text}")?;
             }
             if let Some(tool_call) = tool_call {
@@ -33,10 +122,24 @@ pub fn render_event(event: &KernelEvent, out: &mut impl Write) -> io::Result<()>
             status,
             output,
             reason,
-            ..
+            tainted,
         } => match reason {
-            Some(reason) => writeln!(out, "  [{tool}] {status}: {reason}"),
-            None => writeln!(out, "  [{tool}] {status}: {output}"),
+            Some(reason) => {
+                let reason = if *tainted {
+                    sanitize_for_terminal(reason)
+                } else {
+                    reason.clone()
+                };
+                writeln!(out, "  [{tool}] {status}: {reason}")
+            }
+            None => {
+                let output = if *tainted {
+                    sanitize_for_terminal(output)
+                } else {
+                    output.clone()
+                };
+                writeln!(out, "  [{tool}] {status}: {output}")
+            }
         },
         KernelEvent::TurnComplete => Ok(()),
         KernelEvent::TurnAborted { reason } => writeln!(out, "turn aborted: {reason}"),
@@ -100,6 +203,64 @@ mod tests {
         let rendered = String::from_utf8(buf).expect("render output is valid utf8");
 
         assert!(rendered.contains("buy milk"));
+    }
+
+    #[test]
+    fn Render_TaintedOutputWithAnsiEscapes_StrippedBeforeStdout() {
+        // \x1b[2J (clear screen), \x1b[H (cursor home), and a raw NUL — a terminal-injection
+        // payload an LLM or file-content-derived tool output could carry (SR-17).
+        let payload = "\u{1b}[2J\u{1b}[Hpwned\0";
+        let event = KernelEvent::ToolResult {
+            tool: "read_file".to_string(),
+            status: "ok".to_string(),
+            output: payload.to_string(),
+            reason: None,
+            tainted: true,
+        };
+
+        let mut buf = Vec::new();
+        render_event(&event, &mut buf).expect("render must not error");
+        let rendered = String::from_utf8(buf).expect("render output is valid utf8");
+
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "raw ESC byte must not reach stdout, got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\0'),
+            "raw NUL byte must not reach stdout, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(STRIPPED_PLACEHOLDER),
+            "expected the stripped-content placeholder in output, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("pwned"),
+            "printable content around the escapes should survive, got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn Render_UntaintedUserCommand_RenderedVerbatim() {
+        // Policy (settled explicitly, per H11's "name it" instruction): only *tainted* content is
+        // sanitized. `UserCommand` is kernel-authored from the CLI channel — the operator's own
+        // keystrokes echoed back — so `tainted: false` here renders verbatim, escapes and all.
+        // (A genuinely untrusted `UserCommand`, e.g. piped stdin from an untrusted source, would
+        // be journalled with `tainted: true` and would go through the same sanitization path as
+        // the tool/LLM arms above.)
+        let event = KernelEvent::UserCommand {
+            text: "echo \u{1b}[31mred\u{1b}[0m".to_string(),
+            tainted: false,
+        };
+
+        let mut buf = Vec::new();
+        render_event(&event, &mut buf).expect("render must not error");
+        let rendered = String::from_utf8(buf).expect("render output is valid utf8");
+
+        assert!(
+            rendered.contains('\u{1b}'),
+            "untainted content must render verbatim, escapes included, got: {rendered:?}"
+        );
     }
 
     #[test]
