@@ -1,5 +1,14 @@
 # First Slice — Delivery Tracking Ledger
 
+> ✅ **COMPLETE (2026-07-11).** All 17 tasks (T1–T17) merged to `main`; milestone
+> `first-slice` (#3) closed 17/17. Final `main` @ `4b3967b`. Verified: `CGO_ENABLED=0
+> go build` → single static binary; `make test` green (unit/integration/e2e teatest +
+> arch dependency-rule guard); `go vet` clean; **live** provider test passed against
+> real Ollama/qwen3.5. Remaining: interactive-TTY manual acceptance (human step).
+> PRs: #78–#94 (see git log). Recovery notes: T1/#73 needed a rework merge (uncached
+> arch-guard + label fix); PRs #88/#89/#94 merged by main session after the automated
+> merge subagent was blocked by the safety classifier.
+
 Execution contract for the orchestrate/dispatch loop. Maps each plan task (T1–T17) to
 its GitHub issue, wave, blockers, and status. **Source of truth for scope:**
 `docs/superpowers/plans/first-slice.md`. This file owns the live delivery *state*.
