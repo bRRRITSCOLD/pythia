@@ -3,11 +3,12 @@
 //! what `wasi.rs` scopes down to zero-by-default) and (b) one placeholder slot per capability
 //! actually present in `grants.granted`.
 //!
-//! `fs_read` has a real body as of Task 6 (`crate::host_fns::fs::fs_read`); `net_*_send` and
-//! `secret_get` remain placeholder import slots until Tasks 7 and 8. What Task 5 proved and this
-//! still relies on: a capability that isn't granted has no import slot at all, so a module that
-//! references it fails instantiation with wasmtime's own "unknown import" error — not a runtime
-//! permission check inside a host function that could be forgotten or bypassed.
+//! `fs_read` (Task 6, `crate::host_fns::fs::fs_read`) and `secret_get` (Task 8,
+//! `crate::host_fns::secret::secret_get`) have real bodies; `net_*_send` remains a placeholder
+//! import slot until Task 7. What Task 5 proved and this still relies on: a capability that isn't
+//! granted has no import slot at all, so a module that references it fails instantiation with
+//! wasmtime's own "unknown import" error — not a runtime permission check inside a host function
+//! that could be forgotten or bypassed.
 //!
 //! One WASI preview1 import is deliberately *not* left at its `wasmtime-wasi` default:
 //! `poll_oneoff` is overridden immediately after `add_to_linker_sync` to always deny (see
@@ -17,7 +18,7 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use pythia_manifest::{Capability, ResolvedGrants};
+use pythia_manifest::{host_fn, Capability, ResolvedGrants};
 use wasmtime::{Caller, Engine, Linker};
 
 use crate::host_fns;
@@ -79,6 +80,19 @@ pub(crate) fn build_linker(engine: &Engine, grants: &ResolvedGrants) -> Result<L
     Ok(linker)
 }
 
+/// Registers the real host function body for capabilities that have one (`secret_get`, Task 8),
+/// or the placeholder for the rest (`fs_read`, `net_*_send` — Tasks 6/7). Every branch still
+/// registers *an* import slot for a granted capability; which body runs is the only thing that
+/// changes per task.
+fn register_import(linker: &mut Linker<HostState>, import_name: &str) -> Result<()> {
+    if import_name == host_fn::SECRET_GET {
+        linker.func_wrap(HOST_MODULE, import_name, host_fns::secret::secret_get)?;
+    } else {
+        linker.func_wrap(HOST_MODULE, import_name, placeholder)?;
+    }
+    Ok(())
+}
+
 /// Maps a granted capability to the import name a skill would use to call it. Distinct
 /// capabilities of the same kind (e.g. two `fs:read` grants for different paths) share one
 /// import slot — the per-call scope re-check (Task 6) is what actually distinguishes them, not
@@ -95,13 +109,15 @@ fn import_name_for(capability: &Capability) -> Option<String> {
     }
 }
 
-/// Registers the real host function body for capabilities that have one (`fs_read`, Task 6), or
-/// the placeholder for the rest (`net_*_send`, `secret_get` — Tasks 7/8). Every branch still
-/// registers *an* import slot for a granted capability; which body runs is the only thing that
-/// changes per task.
+/// Registers the real host function body for capabilities that have one (`fs_read`, Task 6;
+/// `secret_get`, Task 8), or the placeholder for the rest (`net_*_send` — Task 7). Every branch
+/// still registers *an* import slot for a granted capability; which body runs is the only thing
+/// that changes per task.
 fn register_import(linker: &mut Linker<HostState>, import_name: &str) -> Result<()> {
-    if import_name == "fs_read" {
+    if import_name == host_fn::FS_READ {
         linker.func_wrap(HOST_MODULE, import_name, host_fns::fs::fs_read)?;
+    } else if import_name == host_fn::SECRET_GET {
+        linker.func_wrap(HOST_MODULE, import_name, host_fns::secret::secret_get)?;
     } else {
         linker.func_wrap(HOST_MODULE, import_name, placeholder)?;
     }
@@ -110,5 +126,5 @@ fn register_import(linker: &mut Linker<HostState>, import_name: &str) -> Result<
 
 /// Placeholder host function body for capabilities without a real implementation yet. Presence
 /// of the import slot — not what it does when called — is the load-bearing behavior Task 5
-/// proves; Tasks 7/8 replace this for `net_*_send`/`secret_get`.
+/// proves; Task 7 replaces this for `net_*_send`.
 fn placeholder(_caller: Caller<'_, HostState>) {}
