@@ -88,6 +88,37 @@ const MULTI_MEMORY_WAT: &str = r#"
         (func (export "noop")))
 "#;
 
+/// Declares a *shared* linear memory and executes `memory.atomic.wait32` against it -- the
+/// WebAssembly threads proposal's blocking wait. A zero-capability skill needs no grant to write
+/// this: with the threads proposal enabled, the guest thread parks forever (`i64.const -1` is an
+/// unbounded relative timeout) and fuel, which only decrements on executed instructions, never
+/// fires on a parked thread. `config.wasm_threads(false)` closes this by making shared memories
+/// (and therefore this module) fail to validate at all.
+const SHARED_MEMORY_ATOMIC_WAIT_WAT: &str = r#"
+    (module
+        (memory (export "memory") 1 1 shared)
+        (func (export "wait_forever") (result i32)
+            (memory.atomic.wait32
+                (i32.const 0)
+                (i32.const 0)
+                (i64.const -1))))
+"#;
+
+/// Imports `poll_oneoff` directly (every wasm32-wasip1 module can, without any capability grant --
+/// it's part of the base WASI surface, not gated by `pythia_host`) and calls it with a
+/// deliberately huge relative-clock subscription count/pointer combination. The host's override
+/// (see `linker::build_linker`) ignores its arguments entirely and denies unconditionally, so this
+/// exercises "does the call return promptly with an error" rather than "is the subscription parsed
+/// correctly" -- the point is that the call never reaches wasmtime-wasi's blocking implementation.
+const POLL_ONEOFF_WAT: &str = r#"
+    (module
+        (import "wasi_snapshot_preview1" "poll_oneoff"
+            (func $poll_oneoff (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (func (export "poll_forever") (result i32)
+            (call $poll_oneoff (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 100))))
+"#;
+
 #[test]
 fn Fuel_InfiniteLoopSkill_ForceTerminatedWithinBudget() {
     let module_bytes = wat::parse_str(INFINITE_LOOP_WAT).expect("wat parses");
@@ -254,4 +285,60 @@ fn Memory_ModuleDeclaringMultipleLinearMemories_RejectedNotAggregated() {
         result.is_err(),
         "a module declaring more than one linear memory must be rejected (multi-memory disabled)"
     );
+}
+
+#[test]
+fn Threads_SharedMemoryWithAtomicWait_RejectedNotInstantiable() {
+    // Fuel-blind hang vector #1: the threads proposal (shared memories + atomic wait/notify) is
+    // enabled by wasmtime's default cargo features. `config.wasm_threads(false)` in
+    // `CapabilityHost::new` must make a shared-memory declaration fail wasm validation outright,
+    // exactly as `wasm_multi_memory(false)` does for `MULTI_MEMORY_WAT` above -- rejected before
+    // any code runs, not caught after the fact.
+    let module_bytes = wat::parse_str(SHARED_MEMORY_ATOMIC_WAIT_WAT).expect("wat parses");
+    let (manifest, policy) = zero_capability_manifest("shared-memory-atomic-wait-skill");
+
+    let host = CapabilityHost::new().expect("engine constructs");
+    let result = host.instantiate(&module_bytes, &manifest, &policy);
+
+    assert!(
+        result.is_err(),
+        "a module declaring a shared memory (threads proposal) must be rejected (threads disabled)"
+    );
+}
+
+#[test]
+fn PollOneoff_LargeRelativeTimer_DeniedPromptlyNotHung() {
+    // Fuel-blind hang vector #2: WASI `poll_oneoff`'s default implementation blocks the host OS
+    // thread for a guest-controlled relative-clock duration -- fuel never fires because no wasm
+    // instruction is executing while the host thread sleeps. The linker's `poll_oneoff` override
+    // must deny every call outright, so this must return well within `HANG_GUARD_TIMEOUT`, not
+    // sleep for anywhere close to it. Uses the same background-thread/bounded-recv hang guard as
+    // `ResourceLimitExceeded_KernelLoopProceeds_DoesNotHang`: a regression that reinstates the
+    // real blocking implementation fails this test loudly instead of wedging the suite.
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let module_bytes = wat::parse_str(POLL_ONEOFF_WAT).expect("wat parses");
+        let (manifest, policy) = zero_capability_manifest("poll-oneoff-skill");
+
+        let host = CapabilityHost::new().expect("engine constructs");
+        let mut instance = host
+            .instantiate(&module_bytes, &manifest, &policy)
+            .expect("instantiation succeeds: poll_oneoff needs no capability grant");
+
+        let result = instance.call_i32("poll_forever", &[]);
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(HANG_GUARD_TIMEOUT) {
+        Ok(Ok(errno)) => assert!(
+            errno != 0,
+            "expected poll_oneoff to deny (non-zero errno), got success (0)"
+        ),
+        Ok(Err(other)) => panic!("expected an Ok(errno) return from the denying stub, got {other}"),
+        Err(_) => panic!(
+            "kernel loop hung: poll_oneoff did not return control within {HANG_GUARD_TIMEOUT:?} \
+             (the blocking WASI implementation was not neutralized)"
+        ),
+    }
 }

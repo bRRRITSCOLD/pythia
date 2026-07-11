@@ -217,6 +217,16 @@ impl CapabilityHost {
         // (Tables can't aggregate the same way: each is capped at TABLE_ELEMENT_LIMIT elements, so
         // even ~100 tables total < 8 MiB — not a host-OOM vector.)
         config.wasm_multi_memory(false);
+        // SR-6 fuel-blind hang vector: the WebAssembly threads proposal (shared memories +
+        // atomic instructions) is enabled by wasmtime 36's default cargo features. A
+        // zero-capability skill needs no grant to declare `(memory 1 1 shared)` and execute
+        // `memory.atomic.wait32` -- the guest thread parks in the kernel, and fuel (which only
+        // decrements on executed instructions) never fires because no instruction is executing
+        // while parked. Every Pythia skill target is single-threaded wasm32-wasip1, which has no
+        // legitimate use for shared memory or atomics, so disable the whole proposal at
+        // validation time: a module declaring a shared memory or an atomic instruction now fails
+        // to instantiate instead of reaching a state where it can park the host thread forever.
+        config.wasm_threads(false);
         let engine = Engine::new(&config).map_err(HostError::Wasmtime)?;
 
         Ok(CapabilityHost { engine })

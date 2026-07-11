@@ -8,6 +8,11 @@
 //! still relies on: a capability that isn't granted has no import slot at all, so a module that
 //! references it fails instantiation with wasmtime's own "unknown import" error — not a runtime
 //! permission check inside a host function that could be forgotten or bypassed.
+//!
+//! One WASI preview1 import is deliberately *not* left at its `wasmtime-wasi` default:
+//! `poll_oneoff` is overridden immediately after `add_to_linker_sync` to always deny (see
+//! `WASI_ERRNO_NOTSUP` below) because its default implementation blocks the host OS thread for a
+//! guest-controlled duration -- a fuel-blind hang no capability grant gates.
 
 use std::collections::HashSet;
 
@@ -22,12 +27,44 @@ use crate::HostState;
 /// `wasi_snapshot_preview1`.
 pub(crate) const HOST_MODULE: &str = "pythia_host";
 
+/// WASI preview1's own import module namespace -- the fixed name `wasmtime_wasi::preview1`
+/// registers every WASI function under (per the `wasi_snapshot_preview1` witx module), and the
+/// same name a `poll_oneoff` override below must target to land in the same linker slot.
+const WASI_PREVIEW1_MODULE: &str = "wasi_snapshot_preview1";
+
+/// `errno::NOTSUP` (58) from `wasi_snapshot_preview1.witx`'s `$errno` enum -- returned by the
+/// `poll_oneoff` stub below so a denied call surfaces as an ordinary WASI error the guest's libc
+/// can translate, not a trap.
+const WASI_ERRNO_NOTSUP: i32 = 58;
+
 pub(crate) fn build_linker(engine: &Engine, grants: &ResolvedGrants) -> Result<Linker<HostState>> {
     let mut linker = Linker::new(engine);
 
     wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |state: &mut HostState| {
         &mut state.wasi
     })?;
+
+    // Fuel-blind hang vector: `poll_oneoff` is WASI preview1's blocking wait -- a guest can
+    // subscribe to a purely relative monotonic-clock timer and the host-side implementation
+    // parks the calling (single-threaded kernel) OS thread for that guest-controlled duration.
+    // Fuel only decrements on executed wasm instructions, so a parked host thread is invisible to
+    // it: this is a hang no fuel budget bounds. Real async waiting is a capability-gated design
+    // this crate doesn't have yet, so for now the entire call is denied at the linker rather than
+    // left wired to wasmtime-wasi's blocking implementation. `allow_shadowing` is needed because
+    // `add_to_linker_sync` above already defined this exact (module, name) slot; this call
+    // replaces that definition rather than adding a second one.
+    linker.allow_shadowing(true);
+    linker.func_wrap(
+        WASI_PREVIEW1_MODULE,
+        "poll_oneoff",
+        |_caller: Caller<'_, HostState>,
+         _in_ptr: i32,
+         _out_ptr: i32,
+         _nsubscriptions: i32,
+         _nevents_out_ptr: i32|
+         -> i32 { WASI_ERRNO_NOTSUP },
+    )?;
+    linker.allow_shadowing(false);
 
     let mut registered = HashSet::new();
     for capability in &grants.granted {
