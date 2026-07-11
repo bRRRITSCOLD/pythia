@@ -3,7 +3,7 @@
 //! link time and trusted for the life of the instance.
 //!
 //! Every probe module exports linear memory, bakes the wasm-supplied path into a data segment
-//! at a fixed offset, and calls the `pythia_host::fs_read(path_ptr, path_len, buf_ptr, buf_cap)
+//! at a fixed offset, and calls the `pythia::fs_read(path_ptr, path_len, buf_ptr, buf_cap)
 //! -> i32` import: a non-negative return is the number of bytes written into `buf_ptr`; negative
 //! sentinels signal denial or an I/O failure.
 
@@ -36,7 +36,7 @@ fn read_probe_wat() -> String {
     format!(
         r#"
         (module
-            (import "pythia_host" "fs_read"
+            (import "pythia" "fs_read"
                 (func $fs_read (param i32 i32 i32 i32) (result i32)))
             (memory (export "memory") 1)
             (func (export "read") (param $path_len i32) (result i32)

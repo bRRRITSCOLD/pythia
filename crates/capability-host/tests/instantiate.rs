@@ -45,7 +45,7 @@ fn Instantiate_GrantedCapability_MatchingImportLinked() {
     // own instantiation-time type check fails the module, independent of capability grants.
     let wat = r#"
         (module
-            (import "pythia_host" "secret_get"
+            (import "pythia" "secret_get"
                 (func $secret_get (param i32 i32 i32) (result i32)))
             (func (export "noop") (result i32) i32.const 0))
     "#;
@@ -74,7 +74,7 @@ fn Instantiate_GrantedCapability_MatchingImportLinked() {
 fn Instantiate_RequestedCapabilityNotGranted_ImportAbsent_InstantiationFails() {
     let wat = r#"
         (module
-            (import "pythia_host" "net_smtp_send" (func $net_smtp_send))
+            (import "pythia" "net_smtp_send" (func $net_smtp_send))
             (func (export "noop") (result i32) i32.const 0))
     "#;
     let module_bytes = wat::parse_str(wat).expect("wat parses");
@@ -92,7 +92,7 @@ fn Instantiate_RequestedCapabilityNotGranted_ImportAbsent_InstantiationFails() {
 
     match result {
         Err(HostError::CapabilityDenied(import)) => {
-            assert_eq!(import, "pythia_host::net_smtp_send");
+            assert_eq!(import, "pythia::net_smtp_send");
         }
         Ok(_) => panic!("expected HostError::CapabilityDenied, got Ok"),
         Err(other) => panic!("expected HostError::CapabilityDenied, got {other}"),

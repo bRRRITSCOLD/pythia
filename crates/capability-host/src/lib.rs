@@ -31,7 +31,10 @@ use pythia_manifest::{resolve, PolicyFile, ResolvedGrants, SkillManifest};
 use wasmtime::{Config, Engine, Module, Store, Trap, Val};
 use wasmtime_wasi::preview1::WasiP1Ctx;
 
-pub use execute::ExecutionResult;
+/// The crate's public boundary (Task 9): the one function the kernel calls per tool dispatch, and
+/// the redacted-by-construction result type it returns. See `execute`'s module doc for how it
+/// assembles `CapabilityHost`/`Instance` (below) with Tasks 6-8's host-function/limit mechanisms.
+pub use execute::{execute, ExecutionResult, ExecutionStatus};
 
 /// Negative sentinels shared across the wasm ABI boundary and this crate's own test suite (a
 /// separate crate, so it can only see `pub` items) -- see `host_fns::fs` for the values and how
@@ -202,11 +205,56 @@ impl Instance {
         HostError::Wasmtime(err)
     }
 
-    /// Wraps `raw` (a skill's unredacted `run`-export bytes) as a redacted-by-construction
-    /// `ExecutionResult`, consuming this instance's handed-out-secrets record in the process
-    /// (SR-5) -- see `execute`'s module doc for why this is the only way to obtain one.
-    pub fn into_execution_result(self, raw: Vec<u8>) -> ExecutionResult {
-        execute::build_execution_result(raw, &self.store.into_data().handed_out_secrets)
+    /// Wraps `raw` (a skill's unredacted `run`-export bytes) as a redacted-by-construction,
+    /// `Ok`-status `ExecutionResult`, consuming this instance's handed-out-secrets record in the
+    /// process (SR-5) -- see `execute`'s module doc for why this is the only way to obtain one.
+    /// `pub(crate)`: `execute()` (same module) is this crate's only caller -- the crate's public
+    /// boundary is `execute()` itself, not this lower-level assembly step.
+    pub(crate) fn into_execution_result(self, raw: Vec<u8>, tainted: bool) -> ExecutionResult {
+        execute::build_ok_result(raw, &self.store.into_data().handed_out_secrets, tainted)
+    }
+
+    /// Stages `args` into this instance's own linear memory via its exported
+    /// `pythia_alloc(len) -> ptr` (never a host-chosen scratch address -- the same "guest
+    /// allocates" contract `pythia-skill-sdk::imports` documents for the opposite direction, host
+    /// functions returning bytes to a skill), calls its `run(args_ptr, args_len, out_len_ptr) ->
+    /// ptr` export, and reads the `(ptr, len)` pair it returns back out of guest memory as owned
+    /// bytes. Matches every skill's `run` export ABI (see e.g. `skills/read-file/src/main.rs`'s
+    /// module doc): all three parameters and the return value are exactly `usize`/pointer-sized,
+    /// i.e. `i32` on `wasm32-wasip1`, so this reuses `call_i32` (and therefore its SR-6 trap
+    /// classification) rather than a bespoke calling convention.
+    pub(crate) fn call_run(&mut self, args: &[u8]) -> Result<Vec<u8>, HostError> {
+        let args_len = i32::try_from(args.len()).map_err(|_| {
+            HostError::Wasmtime(anyhow::anyhow!(
+                "call_run: args length {} does not fit in i32",
+                args.len()
+            ))
+        })?;
+        let args_ptr = self.pythia_alloc(args_len)?;
+        self.write_memory(args_ptr, args)?;
+        let out_len_ptr = self.pythia_alloc(4)?;
+
+        let result_ptr = self.call_i32("run", &[args_ptr, args_len, out_len_ptr])?;
+
+        let out_len_bytes = self.read_memory(out_len_ptr, 4)?;
+        let out_len_array: [u8; 4] = out_len_bytes.try_into().map_err(|_| {
+            HostError::Wasmtime(anyhow::anyhow!("run: out_len read did not return 4 bytes"))
+        })?;
+        let out_len = i32::from_le_bytes(out_len_array);
+
+        if result_ptr == 0 || out_len <= 0 {
+            return Ok(Vec::new());
+        }
+
+        self.read_memory(result_ptr, out_len)
+    }
+
+    /// Calls the instance's exported `pythia_alloc(len) -> ptr` -- the same guest-allocator
+    /// contract this crate's own `secret_get` host function relies on in the opposite direction
+    /// (host asking guest for a buffer). Used by `call_run` to obtain guest-owned buffers for the
+    /// staged `args` and the `out_len` out-param before calling `run`.
+    fn pythia_alloc(&mut self, len: i32) -> Result<i32, HostError> {
+        self.call_i32("pythia_alloc", &[len])
     }
 }
 

@@ -6,7 +6,7 @@
 //!
 //! Every probe module exports linear memory, bakes the requested secret's name into a data
 //! segment, exports a trivial `pythia_alloc` (a fixed-offset bump allocator -- good enough for a
-//! single call per test), and calls the `pythia_host::secret_get(name_ptr, name_len,
+//! single call per test), and calls the `pythia::secret_get(name_ptr, name_len,
 //! out_len_ptr) -> ptr` import, matching `pythia-skill-sdk::imports`'s guest-side declaration.
 
 #![allow(non_snake_case)]
@@ -32,7 +32,7 @@ fn get_secret_probe_wat() -> String {
     format!(
         r#"
         (module
-            (import "pythia_host" "secret_get"
+            (import "pythia" "secret_get"
                 (func $secret_get (param i32 i32 i32) (result i32)))
             (memory (export "memory") 1)
             (func (export "pythia_alloc") (param $len i32) (result i32)
@@ -148,7 +148,7 @@ fn SecretGet_WrongNameNotGranted_DeniedEvenWithSecretImportPresent() {
 fn SecretGet_NotGranted_ImportAbsent() {
     let wat = r#"
         (module
-            (import "pythia_host" "secret_get"
+            (import "pythia" "secret_get"
                 (func $secret_get (param i32 i32 i32) (result i32)))
             (func (export "noop") (result i32) i32.const 0))
     "#;
@@ -167,7 +167,7 @@ fn SecretGet_NotGranted_ImportAbsent() {
 
     match result {
         Err(HostError::CapabilityDenied(import)) => {
-            assert_eq!(import, "pythia_host::secret_get");
+            assert_eq!(import, "pythia::secret_get");
         }
         Ok(_) => panic!("expected HostError::CapabilityDenied, got Ok"),
         Err(other) => panic!("expected HostError::CapabilityDenied, got {other}"),

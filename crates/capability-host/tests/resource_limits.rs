@@ -105,9 +105,10 @@ const SHARED_MEMORY_ATOMIC_WAIT_WAT: &str = r#"
 "#;
 
 /// Imports `poll_oneoff` directly (every wasm32-wasip1 module can, without any capability grant --
-/// it's part of the base WASI surface, not gated by `pythia_host`) and calls it with a
-/// deliberately huge relative-clock subscription count/pointer combination. The host's override
-/// (see `linker::build_linker`) ignores its arguments entirely and denies unconditionally, so this
+/// it's part of the base WASI surface, not gated by the `pythia` host-function import module) and
+/// calls it with a deliberately huge relative-clock subscription count/pointer combination. The
+/// host's override (see `linker::build_linker`) ignores its arguments entirely and denies
+/// unconditionally, so this
 /// exercises "does the call return promptly with an error" rather than "is the subscription parsed
 /// correctly" -- the point is that the call never reaches wasmtime-wasi's blocking implementation.
 const POLL_ONEOFF_WAT: &str = r#"
