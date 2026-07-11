@@ -89,4 +89,34 @@ Slice is shippable. Natural next steps, in rough priority:
 1. Close **#34** (wall-clock watchdog) + **#36** — the two p0 hardening items — before the engine
    runs untrusted skills unattended (the thesis is "the engine you can afford to leave running").
 2. Then **#38** + real `net:smtp_send` body, which unlocks **#39**'s exactly-once (SR-9) work.
-3. `/compainy:orchestrate` can drive these once decomposed, but they're few enough to run inline.
+
+**Decompose first — the 5 open issues are NOT dispatchable as-is.** #34/#36/#38/#39/#41 are broad,
+multi-item tracking issues (each bundles 2–3 sub-tasks), not the PR-sized, single-concern units the
+orchestrate loop dispatches. The autonomous-delivery scout also reads `**Blocked by:** #N` lines from
+issue bodies to order waves — these follow-ups have none yet. So run `/compainy:project-management`
+(or the lead-engineer → project-manager agents) to split them into PR-sized issues with blocked-by
+edges before orchestrating. Given only ~2 hardening items are urgent, running them inline via the
+Agent tool is also reasonable and avoids the decomposition overhead.
+
+## 8. Next-session prompt (copy-paste)
+
+```
+Read docs/superpowers/handoffs/2026-07-11-vertical-slice-complete.md to catch up (Pythia vertical
+slice is COMPLETE — 18/18 tasks merged, both demos green on main). Next: harden the engine before it
+runs untrusted skills unattended. Start with the two p0 follow-ups #34 (SR-6 wall-clock watchdog —
+the convergent fix for the fuel-blind blocking-hang class) and #36 (read_memory alloc-before-bounds
++ denial-reason sanitize).
+
+These 5 open issues (#34/#36/#38/#39/#41) are broad tracking issues, NOT PR-sized — first run
+/compainy:project-management to decompose them into single-concern issues with `**Blocked by:** #N`
+edges, THEN drive them with /compainy:orchestrate using the Workflow tool (mode A — the dynamic
+multi-agent deliver.workflow.mjs), NOT bare main-session dispatch. Fan out parallel-safe issues per
+wave, staff-engineer review gate on every diff, security-architect deep audit on every p0-security /
+security-sensitive diff, squash-merge off latest main.
+
+Stack is pure Rust (wasmtime, rusqlite, tokio, reqwest) — .ai/stack-profile.md is committed.
+Merge gates run on MockProvider; live-Ollama tests stay #[ignore]-gated. NON-NEGOTIABLE process
+guards from last run: (1) implementer PRs MUST base on latest origin/main, never a feature branch;
+(2) after ANY rebase/conflict resolution, `git add` + confirm `git status` clean BEFORE force-push —
+a working-tree fix that compiles but isn't committed ships the un-fixed state and broke main once.
+```
