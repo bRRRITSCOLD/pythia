@@ -66,6 +66,14 @@ type Model struct {
 	busy   bool   // a turn is in flight; submit is disabled while true
 	err    error  // last EventError, if any; TUI stays usable (NFR)
 
+	// assistantStreaming is true while consecutive EventTextDelta events
+	// belong to the same assistant text segment, so only the FIRST delta of
+	// a segment emits the "Pythia:" label + block separator and the rest
+	// append inline. It is cleared whenever a different block begins (user
+	// submit, a tool call, a tool result, turn end) so the next assistant
+	// text starts a fresh labeled block instead of concatenating.
+	assistantStreaming bool
+
 	ready bool // WindowSizeMsg received; viewport/input sized
 
 	cancel context.CancelFunc // cancels the in-flight turn's context, if any
@@ -79,7 +87,7 @@ func NewModel(a *core.Agent, sessionID string) Model {
 	ta.Placeholder = "Send a message..."
 	ta.Prompt = "> "
 	ta.ShowLineNumbers = false
-	ta.SetHeight(3)
+	ta.SetHeight(1)
 	ta.Focus()
 
 	vp := viewport.New(0, 0)
@@ -199,6 +207,15 @@ func (m Model) submit(text string) (tea.Model, tea.Cmd) {
 	m.err = nil
 	m.status = "thinking..."
 
+	// Echo the user's own message into the transcript (SR-1: sanitized like
+	// every other rendered string). Without this the chat window only ever
+	// shows assistant output. Ends the assistant segment so the reply that
+	// follows starts its own labeled block.
+	m.assistantStreaming = false
+	m.beginBlock()
+	m.content.WriteString("You: " + Sanitize(text))
+	m.render()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 
@@ -242,10 +259,21 @@ func (m Model) handleAgentEvent(msg agentEventMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.event.Type {
 	case core.EventTextDelta:
-		m.appendContent(Sanitize(msg.event.TextDelta))
+		// First delta of an assistant segment opens a fresh labeled block;
+		// subsequent deltas append inline so streamed tokens flow together.
+		if !m.assistantStreaming {
+			m.beginBlock()
+			m.content.WriteString("Pythia: ")
+			m.assistantStreaming = true
+		}
+		m.content.WriteString(Sanitize(msg.event.TextDelta))
+		m.render()
 		m.status = "thinking..."
 
 	case core.EventToolCallStarted:
+		// A tool call ends the current assistant text segment so any text
+		// after the tool starts its own labeled block.
+		m.assistantStreaming = false
 		name := "tool"
 		if msg.event.ToolCall != nil {
 			name = Sanitize(msg.event.ToolCall.Name)
@@ -253,10 +281,14 @@ func (m Model) handleAgentEvent(msg agentEventMsg) (tea.Model, tea.Cmd) {
 		m.status = "running tool: " + name
 
 	case core.EventToolCallFinished:
-		m.appendContent(Sanitize(formatToolResult(msg.event.ToolResult)))
+		m.assistantStreaming = false
+		m.beginBlock()
+		m.content.WriteString(Sanitize(formatToolResult(msg.event.ToolResult)))
+		m.render()
 		m.status = "thinking..."
 
 	case core.EventTurnComplete:
+		m.assistantStreaming = false
 		m.busy = false
 		m.status = "ready"
 		if m.cancel != nil {
@@ -279,11 +311,24 @@ func (m Model) handleAgentEvent(msg agentEventMsg) (tea.Model, tea.Cmd) {
 	return m, listenForAgentEvent(msg.ch)
 }
 
-// appendContent adds already-sanitized text to the transcript and scrolls
-// the viewport to the bottom so streamed deltas stay visible as they
-// arrive.
-func (m *Model) appendContent(s string) {
-	m.content.WriteString(s)
+// beginBlock ensures the transcript is positioned at the start of a fresh,
+// blank-line-separated block before the next labeled message (user turn,
+// assistant segment, or tool result) is written — so distinct messages
+// never run together on one line. A no-op on an empty transcript (no
+// leading blank line before the very first message).
+func (m *Model) beginBlock() {
+	if m.content.Len() == 0 {
+		return
+	}
+	if !strings.HasSuffix(m.content.String(), "\n") {
+		m.content.WriteString("\n")
+	}
+	m.content.WriteString("\n")
+}
+
+// render pushes the accumulated transcript into the viewport and scrolls to
+// the bottom so streamed deltas stay visible as they arrive.
+func (m *Model) render() {
 	m.viewport.SetContent(m.content.String())
 	m.viewport.GotoBottom()
 }
