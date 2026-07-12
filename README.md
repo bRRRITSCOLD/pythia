@@ -44,7 +44,7 @@ the documented default.
 | `PYTHIA_OLLAMA_BASE_URL` | `http://localhost:11434` | Base URL of the Ollama server. |
 | `PYTHIA_OLLAMA_MODEL` | `qwen3.5` | Model name to request from Ollama. |
 | `PYTHIA_WORKSPACE_ROOT` | current working directory | Root directory the agent is scoped to (file reads/writes and the bash tool's write scope are bound to this). |
-| `PYTHIA_DB_PATH` | `$XDG_STATE_HOME/pythia/pythia.db` (or `$HOME/.local/state/pythia/pythia.db`) | Session-history database path. Deliberately defaults **outside** the workspace root so a sandboxed bash command — confined to writing inside the workspace — cannot tamper with session history. |
+| `PYTHIA_DB_PATH` | `$XDG_STATE_HOME/pythia/pythia.db` (or `$HOME/.local/state/pythia/pythia.db`) | Session-history database path. Deliberately defaults **outside** the workspace root so that, once the sandbox's syscall filter lands (see the status note in [Bash tool sandbox](#bash-tool-sandbox)), a sandboxed bash command — confined to writing inside the workspace — will not be able to tamper with session history. |
 | `PYTHIA_BASH_TIMEOUT` | `30s` | Per-invocation timeout for the bash tool. |
 | `PYTHIA_MAX_READ_BYTES` | `1048576` (1 MiB) | Cap on bytes read by the file-read tool. |
 | `PYTHIA_MAX_BASH_OUTPUT_BYTES` | `1048576` (1 MiB) | Cap on combined stdout/stderr captured from the bash tool per invocation; output beyond the cap is truncated, not an error. |
@@ -54,27 +54,47 @@ the documented default.
 
 ## Bash tool sandbox
 
+> **Status: partially built, not yet fully active.** The design below is the
+> target state and most of it is implemented and wired into the `bash` tool
+> (Landlock write-scoping, the self-re-exec spine, env scrubbing, fail-closed
+> error handling). The one piece still outstanding is the seccomp-bpf
+> syscall allowlist (T7 / #103): `applySeccomp` is currently a fail-closed
+> stub that always returns an error. Because the sandbox pipeline fails
+> closed by design, this means that **with the sandbox on (the default),
+> every bash-tool invocation currently returns a "sandbox unavailable,
+> command not run" error instead of running** — no syscall filter is
+> installed yet, and nothing runs unconfined as a fallback. The bash tool is
+> only usable today via the explicit `PYTHIA_BASH_SANDBOX=off` escape hatch
+> described below, which is unsandboxed. This section will be updated to
+> drop this notice once T7 lands and the sandbox is verified end-to-end.
+
 The `bash` built-in tool runs model-chosen shell commands. Because the model
 picks the command from untrusted context (a prompt, a prior tool result, a
 file it read), that command is treated as hostile input, not
-developer-authored script — so by default it runs inside an OS-enforced
-sandbox (Landlock + seccomp-bpf, applied via a self-re-exec spine; see
-[ADR-0005](docs/adr/0005-bash-tool-os-sandbox.md) and the
-[threat model](docs/security/bash-sandbox-threat-model.md)). Sandboxed, a
-command may:
+developer-authored script — so by default it is intended to run inside an
+OS-enforced sandbox (Landlock + seccomp-bpf, applied via a self-re-exec
+spine; see [ADR-0005](docs/adr/0005-bash-tool-os-sandbox.md) and the
+[threat model](docs/security/bash-sandbox-threat-model.md)). Once the
+seccomp layer lands, a sandboxed command will be able to:
 
-- **read** broadly (unrestricted at the filesystem-syscall level);
+- **read** broadly (unrestricted at the filesystem-syscall level) — **built,
+  active today** (Landlock);
 - **write** only inside the workspace root and `/tmp` — anywhere else fails
-  with `EACCES`;
+  with `EACCES` — **built, active today** (Landlock, ABI ≥ 2, hardlink/rename
+  escape closed via `refer`);
+- see only an allowlisted, minimal environment (`PATH` fixed to a constant,
+  plus `HOME`/`TERM`/`LANG`) — no inherited secrets, no `LD_PRELOAD` — **built,
+  active today**;
 - make **no network connections**, of any address family (`AF_INET`,
   `AF_INET6`, `AF_UNIX`, `AF_NETLINK`, ...), and cannot route around that
-  denial via io_uring;
+  denial via io_uring — **not yet active** (this is enforced by the seccomp
+  layer below, which is still pending);
 - run under a seccomp **allowlist** (default-deny) — dangerous syscalls
   (`ptrace`, `process_vm_readv/writev`, `mount`, `pivot_root`, `kexec_load`,
   kernel-module and `bpf` syscalls, `unshare`/`setns`, reboot/swap, and any
-  foreign-arch/x32 syscall) are killed, not merely denied;
-- see only an allowlisted, minimal environment (`PATH` fixed to a constant,
-  plus `HOME`/`TERM`/`LANG`) — no inherited secrets, no `LD_PRELOAD`.
+  foreign-arch/x32 syscall) killed, not merely denied — **not yet active**:
+  `applySeccomp` is the fail-closed stub described in the status note above,
+  so today this bullet is the target state, not a live control.
 
 ### `PYTHIA_BASH_SANDBOX`
 
@@ -91,7 +111,8 @@ hardlink-based escape from the write-scope policy open, so the sandbox
 refuses rather than run under a weaker guarantee.
 
 If the sandbox cannot be established — a non-Linux platform, an
-unsupported/older kernel, or any other setup failure — the bash tool
+unsupported/older kernel, a missing syscall filter (today's state, see the
+status note above), or any other setup failure — the bash tool
 **fails closed**: it returns an error result and the command is **never
 run**. It does not silently fall back to running unsandboxed. The only way
 to run bash commands unsandboxed is the explicit `PYTHIA_BASH_SANDBOX=off`
