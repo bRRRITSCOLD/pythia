@@ -10,6 +10,7 @@ require (
 	github.com/elastic/go-seccomp-bpf v1.6.0
 	github.com/go-playground/validator/v10 v10.30.3
 	github.com/landlock-lsm/go-landlock v0.9.0
+	golang.org/x/net v0.54.0
 	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.53.0
 )
@@ -45,7 +46,6 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	golang.org/x/crypto v0.52.0 // indirect
-	golang.org/x/net v0.54.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	kernel.org/pub/linux/libs/security/libcap/psx v1.2.77 // indirect
 	modernc.org/libc v1.73.4 // indirect
