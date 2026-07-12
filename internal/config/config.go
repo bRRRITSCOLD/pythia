@@ -19,16 +19,32 @@ import (
 
 // Config holds Pythia's fully-resolved, validated runtime settings.
 type Config struct {
-	OllamaBaseURL      string        `validate:"required,url"`
-	OllamaModel        string        `validate:"required"`
-	WorkspaceRoot      string        `validate:"required,dir"`
-	DBPath             string        `validate:"required"`
-	BashTimeout        time.Duration `validate:"required,gt=0"`
-	MaxReadBytes       int64         `validate:"required,gt=0"`
-	MaxBashOutputBytes int64         `validate:"required,gt=0"`
-	MaxIterations      int           `validate:"required,gt=0"`
-	SessionID          string        // optional; empty => cmd creates a new session
+	OllamaBaseURL      string          `validate:"required,url"`
+	OllamaModel        string          `validate:"required"`
+	WorkspaceRoot      string          `validate:"required,dir"`
+	DBPath             string          `validate:"required"`
+	BashTimeout        time.Duration   `validate:"required,gt=0"`
+	MaxReadBytes       int64           `validate:"required,gt=0"`
+	MaxBashOutputBytes int64           `validate:"required,gt=0"`
+	MaxIterations      int             `validate:"required,gt=0"`
+	SessionID          string          // optional; empty => cmd creates a new session
+	BashSandbox        BashSandboxMode // the only parent-env switch that can disable the bash sandbox (SR-3a.11, SR-5)
 }
+
+// BashSandboxMode selects whether the bash tool runs inside the OS sandbox.
+// It is read once at startup from the parent process's environment — never
+// from a tool argument or session state — so nothing a model or tool call
+// produces can flip it (SR-3a.11, SR-5).
+type BashSandboxMode string
+
+const (
+	// SandboxOn runs bash tool invocations inside the OS sandbox. This is
+	// the fail-safe default: any unset or unrecognized value resolves here.
+	SandboxOn BashSandboxMode = "on"
+	// SandboxOff disables the OS sandbox. It is selected only by the exact
+	// token "off" — the sole escape hatch, and only from the parent env.
+	SandboxOff BashSandboxMode = "off"
+)
 
 // Env var names and their documented defaults.
 const (
@@ -41,14 +57,21 @@ const (
 	envMaxBashOutputBytes = "PYTHIA_MAX_BASH_OUTPUT_BYTES"
 	envMaxIterations      = "PYTHIA_MAX_ITERATIONS"
 	envSessionID          = "PYTHIA_SESSION_ID"
+	envBashSandbox        = "PYTHIA_BASH_SANDBOX"
 
 	defaultOllamaBaseURL      = "http://localhost:11434"
 	defaultOllamaModel        = "qwen3.5"
-	defaultDBPath             = "./pythia.db"
 	defaultBashTimeout        = 30 * time.Second
 	defaultMaxReadBytes       = 1048576
 	defaultMaxBashOutputBytes = 1048576
 	defaultMaxIterations      = 10
+
+	// defaultDBDirName / defaultDBFileName make up the default session-DB
+	// location, rooted outside the workspace (SR-3a.13): a sandboxed bash
+	// command can only write inside WorkspaceRoot, so a DB living under the
+	// user's XDG state dir is unreachable to it.
+	defaultDBDirName  = "pythia"
+	defaultDBFileName = "pythia.db"
 )
 
 // Load reads Config from the environment, applying documented defaults for
@@ -98,16 +121,26 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	dbPath := os.Getenv(envDBPath)
+	if dbPath == "" {
+		resolved, err := defaultDBPath()
+		if err != nil {
+			return Config{}, fmt.Errorf("config: resolve default DB path: %w", err)
+		}
+		dbPath = resolved
+	}
+
 	cfg := Config{
 		OllamaBaseURL:      stringOrDefault(envOllamaBaseURL, defaultOllamaBaseURL),
 		OllamaModel:        stringOrDefault(envOllamaModel, defaultOllamaModel),
 		WorkspaceRoot:      workspaceRoot,
-		DBPath:             stringOrDefault(envDBPath, defaultDBPath),
+		DBPath:             dbPath,
 		BashTimeout:        bashTimeout,
 		MaxReadBytes:       maxReadBytes,
 		MaxBashOutputBytes: maxBashOutputBytes,
 		MaxIterations:      maxIterations,
 		SessionID:          os.Getenv(envSessionID),
+		BashSandbox:        parseBashSandbox(envBashSandbox),
 	}
 
 	if err := validator.New().Struct(cfg); err != nil {
@@ -115,6 +148,38 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// parseBashSandbox resolves the BashSandboxMode from the named env var.
+// Fail-safe by design (SR-3a.11): unset, or any value other than the exact
+// token "off", resolves to SandboxOn. Only "off" disables the sandbox.
+func parseBashSandbox(env string) BashSandboxMode {
+	if os.Getenv(env) == string(SandboxOff) {
+		return SandboxOff
+	}
+	return SandboxOn
+}
+
+// defaultDBPath resolves the default session-DB location outside the
+// default workspace root (SR-3a.13): $XDG_STATE_HOME/pythia/pythia.db,
+// falling back to $HOME/.local/state/pythia/pythia.db. The containing
+// directory is created if absent so the DB adapter can open it directly.
+func defaultDBPath() (string, error) {
+	stateHome := os.Getenv("XDG_STATE_HOME")
+	if stateHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		stateHome = filepath.Join(home, ".local", "state")
+	}
+
+	dir := filepath.Join(stateHome, defaultDBDirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create state dir %q: %w", dir, err)
+	}
+
+	return filepath.Join(dir, defaultDBFileName), nil
 }
 
 // canonicalizeDir resolves dir to an absolute, symlink-evaluated path.
