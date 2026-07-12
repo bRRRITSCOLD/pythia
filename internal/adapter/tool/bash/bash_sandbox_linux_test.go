@@ -26,14 +26,18 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// TestBash_SandboxedEchoThroughInvoke_ReturnsOkEnvelope drives a real
-// command all the way through Invoke with the sandbox on: bashTool builds a
-// sandbox.Policy from its own workDir, hands it to the re-exec spine (T5),
-// which applies Landlock (T6) and seccomp (T7) before execve'ing into
-// /bin/bash — and the result still comes back as the frozen, unchanged
-// output envelope (SR-3a.10, integration-tier per principles-tdd since it
-// exercises the real OS spine rather than a fake).
-func TestBash_SandboxedEchoThroughInvoke_ReturnsOkEnvelope(t *testing.T) {
+// TestBash_SandboxedEchoThroughInvoke_FailsClosedUntilSeccompImplemented
+// drives a real command all the way through Invoke with the sandbox on:
+// bashTool builds a sandbox.Policy from its own workDir and hands it to the
+// re-exec spine (T5), which applies Landlock (T6, real) before reaching
+// applySeccomp (T7, #103, still a fail-closed stub — see
+// sandbox/seccomp_linux.go). Until T7 lands, the production path must
+// refuse to run the command rather than presenting as fully sandboxed with
+// no syscall filter installed (ADR-0005 §5, SR-3a fail-closed), so this
+// locks in a soft error envelope — command never run — rather than a
+// misleading success. Flip this back to asserting a success envelope (see
+// git history for the prior version) once T7 lands.
+func TestBash_SandboxedEchoThroughInvoke_FailsClosedUntilSeccompImplemented(t *testing.T) {
 	dir := t.TempDir()
 	tool := New(dir, 5*time.Second, 1<<20, true)
 
@@ -42,11 +46,13 @@ func TestBash_SandboxedEchoThroughInvoke_ReturnsOkEnvelope(t *testing.T) {
 		t.Fatalf("unexpected Go error: %v", err)
 	}
 
-	r := decodeOK(t, raw)
-	if strings.TrimSpace(r.OK.Stdout) != "sandboxed-hello" {
-		t.Errorf("stdout = %q, want sandboxed-hello (raw=%s)", r.OK.Stdout, raw)
+	var envelope struct {
+		Error string `json:"error"`
 	}
-	if r.OK.ExitCode != 0 {
-		t.Errorf("exit_code = %d, want 0 (raw=%s)", r.OK.ExitCode, raw)
+	if jsonErr := json.Unmarshal(raw, &envelope); jsonErr != nil {
+		t.Fatalf("decode envelope: %v (raw=%s)", jsonErr, raw)
+	}
+	if !strings.Contains(envelope.Error, "sandbox unavailable") {
+		t.Fatalf("error = %q, want it to report the sandbox as unavailable (raw=%s)", envelope.Error, raw)
 	}
 }

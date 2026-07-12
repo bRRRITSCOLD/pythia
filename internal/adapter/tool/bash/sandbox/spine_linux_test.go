@@ -22,6 +22,17 @@ import (
 // contrive a real apply-step failure (the no-op T5 stubs never fail).
 const forceFailSubcommand = "__bash-sandbox-test-force-fail"
 
+// noSeccompSubcommand is a second test-only reserved marker: TestMain
+// routes it to noSeccompChild, which runs the real frozen apply sequence
+// (thread lock, frame read, chdir, NO_NEW_PRIVS, env scrub, real
+// applyLandlock, fd hygiene, exec) but substitutes a no-op for applySeccomp.
+// This lets the spine-mechanics tests below keep exercising the rest of the
+// real sequence while T7 (#103) is still a fail-closed stub — see
+// applySeccomp's doc comment. The real production path (ChildSubcommand)
+// is exercised separately by
+// TestRun_ProductionPath_FailsClosedUntilSeccompImplemented.
+const noSeccompSubcommand = "__bash-sandbox-test-no-seccomp"
+
 // TestMain lets this test binary act as its own re-exec target: Run always
 // re-execs the current binary via /proc/self/exe, which — inside `go test`
 // — is this very test binary, not cmd/pythia. Intercepting the reserved
@@ -36,6 +47,8 @@ func TestMain(m *testing.M) {
 			os.Exit(RunChild())
 		case forceFailSubcommand:
 			os.Exit(forceFailChild())
+		case noSeccompSubcommand:
+			os.Exit(runChildWithApply(applyLandlock, func() error { return nil }))
 		}
 	}
 	os.Exit(m.Run())
@@ -52,12 +65,19 @@ func forceFailChild() int {
 	return 1
 }
 
+// runSpine is execSandboxed pinned to noSeccompSubcommand: the spine
+// mechanics tests below want to exercise the real sequence end to end
+// without being blocked by T7's fail-closed seccomp stub.
+func runSpine(ctx context.Context, p Policy, command string, stdout, stderr io.Writer) (int, error) {
+	return execSandboxed(ctx, p, command, stdout, stderr, noSeccompSubcommand)
+}
+
 func TestRun_SimpleCommand_ReExecsAndReturnsOutput(t *testing.T) {
 	var out, errb bytes.Buffer
-	code, err := Run(context.Background(), Policy{WorkspaceRoot: t.TempDir(), TmpDir: "/tmp"},
+	code, err := runSpine(context.Background(), Policy{WorkspaceRoot: t.TempDir(), TmpDir: "/tmp"},
 		"echo spine-ok", &out, &errb)
 	if err != nil {
-		t.Fatalf("Run: %v", err)
+		t.Fatalf("runSpine: %v", err)
 	}
 	if code != 0 || strings.TrimSpace(out.String()) != "spine-ok" {
 		t.Fatalf("code=%d out=%q err=%q", code, out.String(), errb.String())
@@ -68,10 +88,10 @@ func TestRun_CommandWithMetachars_DeliveredIntactNeverArgv(t *testing.T) {
 	var out bytes.Buffer
 	// Newline, a subshell, and quotes: if this were argv-interpolated
 	// anywhere along the way it would misparse or split into extra tokens.
-	code, err := Run(context.Background(), Policy{WorkspaceRoot: t.TempDir(), TmpDir: "/tmp"},
+	code, err := runSpine(context.Background(), Policy{WorkspaceRoot: t.TempDir(), TmpDir: "/tmp"},
 		"printf 'a\nb'; echo \" q'q \"", &out, io.Discard)
 	if err != nil {
-		t.Fatalf("Run: %v", err)
+		t.Fatalf("runSpine: %v", err)
 	}
 	if code != 0 {
 		t.Fatalf("command exited %d: %q", code, out.String())
@@ -96,10 +116,10 @@ func TestRun_FdHygiene_OnlyStdioReachesChild(t *testing.T) {
 	defer f.Close()
 
 	var out bytes.Buffer
-	code, err := Run(context.Background(), Policy{WorkspaceRoot: t.TempDir(), TmpDir: "/tmp"},
+	code, err := runSpine(context.Background(), Policy{WorkspaceRoot: t.TempDir(), TmpDir: "/tmp"},
 		"ls -1 /proc/self/fd", &out, io.Discard)
 	if err != nil {
-		t.Fatalf("Run: %v", err)
+		t.Fatalf("runSpine: %v", err)
 	}
 	if code != 0 {
 		t.Fatalf("ls exited %d: %s", code, out.String())
@@ -125,16 +145,61 @@ func TestRun_FdHygiene_OnlyStdioReachesChild(t *testing.T) {
 
 func TestRun_NoNewPrivs_SetuidBinaryGainsNothing(t *testing.T) {
 	var out bytes.Buffer
-	code, err := Run(context.Background(), Policy{WorkspaceRoot: t.TempDir(), TmpDir: "/tmp"},
+	code, err := runSpine(context.Background(), Policy{WorkspaceRoot: t.TempDir(), TmpDir: "/tmp"},
 		"grep NoNewPrivs /proc/self/status", &out, io.Discard)
 	if err != nil {
-		t.Fatalf("Run: %v", err)
+		t.Fatalf("runSpine: %v", err)
 	}
 	if code != 0 {
 		t.Fatalf("grep exited %d: %q", code, out.String())
 	}
 	if !strings.Contains(out.String(), "NoNewPrivs:\t1") {
 		t.Fatalf("NO_NEW_PRIVS not set in sandboxed child: %q", out.String())
+	}
+}
+
+// TestRun_WorkDir_ChildRunsInWorkspaceRoot locks in SR-3b for the sandboxed
+// path: the confined command must observe Policy.WorkspaceRoot as its
+// working directory, the same contract the legacy direct-exec path gets
+// via cmd.Dir. Regression test for the missing os.Chdir in runChild.
+func TestRun_WorkDir_ChildRunsInWorkspaceRoot(t *testing.T) {
+	root := t.TempDir()
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%s): %v", root, err)
+	}
+
+	var out bytes.Buffer
+	code, err := runSpine(context.Background(), Policy{WorkspaceRoot: root, TmpDir: "/tmp"},
+		"pwd", &out, io.Discard)
+	if err != nil {
+		t.Fatalf("runSpine: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("pwd exited %d: %q", code, out.String())
+	}
+	if got := strings.TrimSpace(out.String()); got != resolvedRoot {
+		t.Errorf("pwd = %q, want %q (sandboxed child did not chdir into WorkspaceRoot)", got, resolvedRoot)
+	}
+}
+
+// TestRun_ProductionPath_FailsClosedUntilSeccompImplemented documents and
+// locks in the current, intentional posture of the real production path
+// (ChildSubcommand, i.e. what bashTool.Invoke drives): until T7 (#103)
+// replaces applySeccomp's fail-closed stub with a real filter, Run must
+// refuse to run the command rather than silently presenting as fully
+// sandboxed with no syscall filter installed (ADR-0005 §5, SR-3a
+// fail-closed). This test should be updated (or deleted, folded back into
+// TestRun_SimpleCommand_ReExecsAndReturnsOutput et al.) once T7 lands.
+func TestRun_ProductionPath_FailsClosedUntilSeccompImplemented(t *testing.T) {
+	var out bytes.Buffer
+	_, err := Run(context.Background(), Policy{WorkspaceRoot: t.TempDir(), TmpDir: "/tmp"},
+		"echo should-not-run", &out, io.Discard)
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("Run err = %v, want wrapping ErrUnsupported (seccomp not yet implemented)", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("command produced output despite fail-closed setup failure: %q", out.String())
 	}
 }
 
