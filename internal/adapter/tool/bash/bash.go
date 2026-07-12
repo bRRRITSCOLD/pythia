@@ -10,10 +10,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
+	"sync"
 	"time"
 
+	"github.com/bRRRITSCOLD/pythia/internal/adapter/tool/bash/sandbox"
 	"github.com/bRRRITSCOLD/pythia/internal/adapter/tool/toolkit"
 	"github.com/bRRRITSCOLD/pythia/internal/core"
 )
@@ -46,22 +50,48 @@ type output struct {
 	TimedOut  bool   `json:"timed_out"`
 }
 
-// bashTool is the core.Tool implementation. workDir, timeout, and
-// maxOutputBytes are fixed at construction (SR-3b, SR-3, SR-4c) — nothing in
-// Invoke's args can override them (SR-5).
+// bashTool is the core.Tool implementation. workDir, timeout,
+// maxOutputBytes, and sandbox are fixed at construction (SR-3b, SR-3,
+// SR-4c) — nothing in Invoke's args can override them (SR-5). sandbox is a
+// plain bool decided by the parent (cmd/pythia/main.go, from
+// cfg.BashSandbox) — this package intentionally does not import config, so
+// the on/off decision is handed in as a value rather than resolved here
+// (keeps the adapter layer free of config coupling, verified by
+// `make arch-test`).
 type bashTool struct {
 	workDir        string
 	timeout        time.Duration
 	maxOutputBytes int64
+	sandbox        bool
+
+	// logUnsandboxedOnce ensures the "bash sandbox DISABLED" repudiation-
+	// control log (SR-3a.11) is emitted at most once per tool instance, no
+	// matter how many times Invoke runs the legacy off-branch.
+	logUnsandboxedOnce sync.Once
+
+	// runSandboxed defaults to sandbox.Run; overridable only in this
+	// package's own tests, so the fail-closed envelope-mapping behavior in
+	// invokeSandboxed can be exercised deterministically on any GOOS
+	// without depending on sandbox.ErrUnsupported's platform-specific
+	// trigger conditions.
+	runSandboxed func(ctx context.Context, p sandbox.Policy, command string, stdout, stderr io.Writer) (int, error)
 }
 
+// defaultRunSandboxed is sandbox.Run, captured at package scope so New's
+// "sandbox bool" parameter (its name frozen by the plan/issue's interface
+// spec) can shadow the sandbox package name inside its own body without
+// losing the ability to reference sandbox.Run.
+var defaultRunSandboxed = sandbox.Run
+
 // New constructs the bash tool bound to a fixed workDir, a per-invocation
-// timeout, and a bounded output cap in bytes.
-func New(workDir string, timeout time.Duration, maxOutputBytes int64) core.Tool {
+// timeout, a bounded output cap in bytes, and the sandbox on/off decision.
+func New(workDir string, timeout time.Duration, maxOutputBytes int64, sandbox bool) core.Tool {
 	return &bashTool{
 		workDir:        workDir,
 		timeout:        timeout,
 		maxOutputBytes: maxOutputBytes,
+		sandbox:        sandbox,
+		runSandboxed:   defaultRunSandboxed,
 	}
 }
 
@@ -75,10 +105,12 @@ func (t *bashTool) Schema() core.ToolSchema {
 	}
 }
 
-// Invoke runs the requested command. A Go error is returned only for an
-// exec-launch failure (infrastructure failure); malformed args, a non-zero
-// exit, a timeout, and truncated output are all soft results carried in the
-// returned envelope so the turn loop can feed them back to the model.
+// Invoke runs the requested command, routed through the OS sandbox when
+// t.sandbox is on and via the legacy direct-exec path when it is off. A Go
+// error is returned only for an exec-launch failure (infrastructure
+// failure); malformed args, a non-zero exit, a timeout, truncated output,
+// and a sandbox setup failure are all soft results carried in the returned
+// envelope so the turn loop can feed them back to the model.
 func (t *bashTool) Invoke(ctx context.Context, rawArgs json.RawMessage) (json.RawMessage, error) {
 	var a args
 	if err := toolkit.Validate(rawArgs, &a); err != nil {
@@ -88,7 +120,51 @@ func (t *bashTool) Invoke(ctx context.Context, rawArgs json.RawMessage) (json.Ra
 	ctx2, cancel := context.WithTimeout(ctx, t.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx2, "bash", "-c", a.Command)
+	if t.sandbox {
+		return t.invokeSandboxed(ctx2, a.Command)
+	}
+	return t.invokeUnsandboxed(ctx2, a.Command)
+}
+
+// invokeSandboxed routes command through the sandbox package (SR-3a.10).
+// Any setup error — including sandbox.ErrUnsupported — means the command
+// never ran: this returns a soft error envelope, never a partial result,
+// and never falls back to the unsandboxed path (fail-closed).
+func (t *bashTool) invokeSandboxed(ctx context.Context, command string) (json.RawMessage, error) {
+	stdout := newLimitedBuffer(t.maxOutputBytes)
+	stderr := newLimitedBuffer(t.maxOutputBytes)
+
+	policy := sandbox.Policy{WorkspaceRoot: t.workDir, TmpDir: os.TempDir()}
+
+	exitCode, err := t.runSandboxed(ctx, policy, command, stdout, stderr)
+	if err != nil {
+		// Fail-closed: the sandbox could not be set up (or is unsupported
+		// on this platform/kernel) — the command was never executed.
+		return toolkit.Err("bash: sandbox unavailable, command not run: %v", err), nil
+	}
+
+	out := output{
+		Stdout:    stdout.String(),
+		Stderr:    stderr.String(),
+		ExitCode:  exitCode,
+		Truncated: stdout.truncated || stderr.truncated,
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		out.TimedOut = true
+	}
+	return toolkit.OK(out), nil
+}
+
+// invokeUnsandboxed is the legacy direct-exec path, used only when the
+// sandbox is explicitly disabled (SR-3a.11). It emits a one-time "bash
+// sandbox DISABLED" log (repudiation control) the first time it runs on
+// this tool instance.
+func (t *bashTool) invokeUnsandboxed(ctx context.Context, command string) (json.RawMessage, error) {
+	t.logUnsandboxedOnce.Do(func() {
+		slog.Warn("bash sandbox DISABLED: running commands unsandboxed", "reason", "PYTHIA_BASH_SANDBOX=off")
+	})
+
+	cmd := exec.CommandContext(ctx, "bash", "-c", command)
 	cmd.Dir = t.workDir
 	// SR-3c: only the parent process's own env — nothing is added, nothing
 	// from args is merged in, so no extra secrets ever reach the subprocess.
@@ -107,7 +183,7 @@ func (t *bashTool) Invoke(ctx context.Context, rawArgs json.RawMessage) (json.Ra
 		Truncated: stdout.truncated || stderr.truncated,
 	}
 
-	if ctx2.Err() == context.DeadlineExceeded {
+	if ctx.Err() == context.DeadlineExceeded {
 		out.TimedOut = true
 	}
 
