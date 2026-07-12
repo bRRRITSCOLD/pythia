@@ -1,8 +1,15 @@
 // Package bash implements the "bash" built-in tool: it runs a shell command
 // in a subprocess bound by a configured working directory, a context
 // timeout, and a bounded output buffer (SR-3, SR-4c, SR-5). The boundary is
-// isolated behind core.Tool so a future OS sandbox (SR-3a) can drop in
-// behind this same seam.
+// isolated behind core.Tool so the OS sandbox (SR-3a, see the sandbox
+// subpackage and ADR-0005) drops in behind this same seam.
+//
+// The sandbox cannot close every risk — a sandboxed command's stdout is
+// still returned to the model. That residual risk, the load-bearing
+// local-Ollama assumption it depends on, and the deferred hardening items
+// (rlimits, denied-syscall observability) are documented in
+// docs/security/bash-sandbox-residual-risk.md and
+// docs/security/bash-sandbox-threat-model.md.
 package bash
 
 import (

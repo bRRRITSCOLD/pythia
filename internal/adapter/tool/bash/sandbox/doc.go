@@ -13,4 +13,14 @@
 // else here is an internal implementation detail, filled in by later tasks
 // on the plan's critical path (T3 wire framing, T4 env scrub, T5 the spine,
 // T6/T7 the Landlock/seccomp controls).
+//
+// The controls this package applies (Landlock write-scoping, seccomp
+// syscall allowlist, env scrub, network denial) are documented end-to-end
+// in ADR-0005 (docs/adr/0005-bash-tool-os-sandbox.md) and the threat model
+// (docs/security/bash-sandbox-threat-model.md, SR-3a.1-.14). What this
+// package deliberately does NOT close — a sandboxed command's stdout is
+// still returned to the model — is recorded, with its load-bearing
+// local-Ollama assumption and the deferred H1 (rlimits) / H3 (denied-
+// syscall observability) hardening items, in
+// docs/security/bash-sandbox-residual-risk.md.
 package sandbox
