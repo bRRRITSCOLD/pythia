@@ -20,6 +20,14 @@ type Policy struct {
 	TmpDir string
 }
 
+// ChildSubcommand is the reserved argv[1] cmd/pythia/main.go dispatches
+// straight to RunChild, before any other startup work (config.Load, the
+// TUI). It is a fixed marker only — the shell command bytes themselves are
+// never carried on argv, only over the out-of-band pipe (ADR-0005 §3,
+// SR-3a.13). Defined once here (no build tag) so main.go and the Linux
+// spine share a single source of truth instead of duplicating the literal.
+const ChildSubcommand = "__bash-sandbox"
+
 // ErrUnsupported is returned by Run and reported by RunChild when the OS
 // sandbox cannot be enforced on the current platform or kernel — including
 // every non-Linux GOOS, and (once T5 lands) a Linux kernel older than 5.13
