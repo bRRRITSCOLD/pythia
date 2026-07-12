@@ -27,6 +27,14 @@ var envVars = []string{
 // restores each var's prior value (or absence) on cleanup. t.Setenv can only
 // set a value, never truly unset one, so tests that need to exercise
 // defaulting for a genuinely-unset var must unset directly via os.Unsetenv.
+//
+// It also points XDG_STATE_HOME at a fresh per-test temp dir so that any
+// test reaching defaultDBPath() (i.e. one that leaves PYTHIA_DB_PATH unset)
+// provisions its default state dir under that temp dir instead of mutating
+// the real $HOME/.local/state/pythia on the developer's machine or CI
+// runner. t.TempDir() returns a distinct directory per call, so this never
+// collides with a separately-set PYTHIA_WORKSPACE_ROOT temp dir, preserving
+// the "default DB path is outside the workspace" invariant.
 func unsetAll(t *testing.T) {
 	t.Helper()
 	for _, v := range envVars {
@@ -40,6 +48,7 @@ func unsetAll(t *testing.T) {
 			}
 		})
 	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 }
 
 func TestLoad_NoEnvSet_AppliesValidDefaults(t *testing.T) {
