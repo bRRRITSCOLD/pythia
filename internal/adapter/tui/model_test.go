@@ -39,12 +39,78 @@ func TestModel_TextDeltaMsg_AppendsSanitizedTextToViewport(t *testing.T) {
 	m = next2.(Model)
 
 	got := m.content.String()
-	want := "hello red world"
+	want := "Pythia: hello red world"
 	if got != want {
 		t.Errorf("content = %q, want %q", got, want)
 	}
 	if strings.Contains(got, "\x1b") {
 		t.Errorf("content = %q, contains unsanitized escape byte", got)
+	}
+}
+
+// TestModel_Submit_EchoesUserMessage verifies the user's own message is
+// written into the transcript (labeled "You:") when a turn is submitted —
+// without this the chat window only ever shows assistant output and the
+// user never sees what they asked (the "past messages don't show" bug).
+func TestModel_Submit_EchoesUserMessage(t *testing.T) {
+	m := newTestModel()
+
+	next, _ := m.submit("what's in go.mod?")
+	m = next.(Model)
+
+	got := m.content.String()
+	if !strings.Contains(got, "You: what's in go.mod?") {
+		t.Errorf("content = %q, want it to echo the user message", got)
+	}
+}
+
+// TestModel_Transcript_SeparatesUserFromAssistant verifies distinct blocks
+// are newline-separated and role-labeled, so a user message and the
+// assistant reply never run together (the "no new line" bug where
+// "...today?Pragmatic DDD..." concatenated two messages).
+func TestModel_Transcript_SeparatesUserFromAssistant(t *testing.T) {
+	m := newTestModel()
+	ch := make(chan core.AgentEvent)
+
+	n1, _ := m.submit("hi")
+	m = n1.(Model)
+
+	n2, _ := m.handleAgentEvent(agentEventMsg{
+		event: core.AgentEvent{Type: core.EventTextDelta, TextDelta: "Hello!"},
+		ch:    ch,
+	})
+	m = n2.(Model)
+
+	got := m.content.String()
+	want := "You: hi\n\nPythia: Hello!"
+	if got != want {
+		t.Errorf("content = %q, want %q", got, want)
+	}
+}
+
+// TestModel_Transcript_SeparatesConsecutiveAssistantSegments verifies that a
+// second assistant text segment (after a tool call within the same turn, or
+// a fresh turn) starts its own labeled block instead of concatenating onto
+// the previous assistant text.
+func TestModel_Transcript_SeparatesConsecutiveAssistantSegments(t *testing.T) {
+	m := newTestModel()
+	ch := make(chan core.AgentEvent)
+
+	send := func(ev core.AgentEvent) {
+		next, _ := m.handleAgentEvent(agentEventMsg{event: ev, ch: ch})
+		m = next.(Model)
+	}
+
+	send(core.AgentEvent{Type: core.EventTextDelta, TextDelta: "first"})
+	send(core.AgentEvent{Type: core.EventToolCallStarted, ToolCall: &core.ToolCall{ID: "c1", Name: "read"}})
+	send(core.AgentEvent{Type: core.EventTextDelta, TextDelta: "second"})
+
+	got := m.content.String()
+	if strings.Contains(got, "firstsecond") {
+		t.Errorf("content = %q, assistant segments concatenated without separation", got)
+	}
+	if !strings.Contains(got, "first") || !strings.Contains(got, "second") {
+		t.Errorf("content = %q, want it to contain both segments", got)
 	}
 }
 
