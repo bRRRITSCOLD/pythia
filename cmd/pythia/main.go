@@ -111,7 +111,7 @@ func bootstrap(cfg config.Config) (*tea.Program, *deps, error) {
 		read.New(cfg.WorkspaceRoot, cfg.MaxReadBytes),
 		write.New(cfg.WorkspaceRoot),
 		edit.New(cfg.WorkspaceRoot),
-		bash.New(cfg.WorkspaceRoot, cfg.BashTimeout, cfg.MaxBashOutputBytes),
+		bash.New(cfg.WorkspaceRoot, cfg.BashTimeout, cfg.MaxBashOutputBytes, cfg.BashSandbox == config.SandboxOn),
 	}
 	reg, err := registry.New(tools...)
 	if err != nil {
