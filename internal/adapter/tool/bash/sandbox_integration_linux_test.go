@@ -104,11 +104,31 @@ func assertRunsButDenied(t *testing.T, command string) invokeOutput {
 	return out
 }
 
+// outsideScopeDir returns a writable directory that is NEITHER the workspace
+// NOR under /tmp — i.e. genuinely outside the sandbox write scope
+// (workspace + /tmp). It is created under $HOME, which the process uid owns
+// and can write via Unix DAC, so a write DENIED there proves the sandbox
+// (Landlock), not DAC, blocked it. Removed at test end. Using t.TempDir()
+// here would be wrong: it lives under /tmp, which IS in the write scope.
+func outsideScopeDir(t *testing.T) string {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+	d, err := os.MkdirTemp(home, ".pythia-sandbox-outside-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp under $HOME: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	return d
+}
+
 // --- Through-Invoke control matrix (spec "Testing" bullets) ---
 
 // TestSandbox_WriteOutsideWorkspace_DeniedViaInvoke — SR-3a.8.
 func TestSandbox_WriteOutsideWorkspace_DeniedViaInvoke(t *testing.T) {
-	outside := t.TempDir()
+	outside := outsideScopeDir(t)
 	out := assertRunsButDenied(t, "echo bypass > "+outside+"/escape.txt")
 	if _, statErr := os.Stat(outside + "/escape.txt"); !os.IsNotExist(statErr) {
 		t.Errorf("write outside workspace produced a file despite denial: statErr=%v stderr=%q", statErr, out.Stderr)
@@ -295,7 +315,10 @@ func TestSandbox_BinaryOverwriteAttempt_DeniedReExecIntegrityHeld(t *testing.T) 
 
 // TestSandbox_SessionDBTamperAttempt_Denied — SR-3a.13.
 func TestSandbox_SessionDBTamperAttempt_Denied(t *testing.T) {
-	stateDir := t.TempDir()
+	// The real session DB lives at $XDG_STATE_HOME (~/.local/state/pythia),
+	// relocated out of the write scope in T1 — modelled here by an
+	// out-of-scope ($HOME) dir, NOT /tmp (which is in scope).
+	stateDir := outsideScopeDir(t)
 	dbPath := stateDir + "/sessions.db"
 	if err := os.WriteFile(dbPath, []byte("original"), 0o644); err != nil {
 		t.Fatalf("seed session db: %v", err)
@@ -329,16 +352,19 @@ func TestSandbox_ThroughRegistry_WriteTmpReadHostname_SucceedsViaInvoke(t *testi
 		t.Fatal(`registry.Get("bash") = false, want true`)
 	}
 
-	// Written under the tool's workspace root rather than os.TempDir():
-	// child_linux.go's frozen apply sequence only threads
-	// Policy.WorkspaceRoot through to applyLandlock (Policy.TmpDir is
-	// never included there, nor carried over the T3 wire frame at all) —
-	// a pre-existing gap in the T5/T6 write-scope wiring, tracked
-	// separately and out of this file's scope (T9 test-only PR).
-	probe := dir + "/pythia-t9-registry-probe-ok"
-	defer os.Remove(probe)
+	// Written under os.TempDir() (/tmp) — the SECOND write-scope root, now
+	// that Policy.TmpDir is threaded over the wire frame into the child's
+	// Landlock ruleset. This exercises /tmp writability end-to-end (the
+	// gap that previously forced this probe into the workspace root).
+	probe, err := os.CreateTemp("", "pythia-registry-probe-ok-*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	probe.Close()
+	probePath := probe.Name()
+	defer os.Remove(probePath)
 
-	raw, err := resolved.Invoke(context.Background(), json.RawMessage(`{"command":"echo hi > `+probe+` && cat /etc/hostname"}`))
+	raw, err := resolved.Invoke(context.Background(), json.RawMessage(`{"command":"echo hi > `+probePath+` && cat /etc/hostname"}`))
 	if err != nil {
 		t.Fatalf("unexpected Go error: %v", err)
 	}
@@ -357,7 +383,7 @@ func TestSandbox_ThroughRegistry_WriteTmpReadHostname_SucceedsViaInvoke(t *testi
 // divergence introduced by the registry layer itself.
 func TestSandbox_ThroughRegistry_WriteOutsideScope_DeniedViaInvoke(t *testing.T) {
 	dir := t.TempDir()
-	outside := t.TempDir()
+	outside := outsideScopeDir(t)
 	tool := New(dir, 5*time.Second, 1<<20, true)
 
 	reg, err := registry.New(tool)

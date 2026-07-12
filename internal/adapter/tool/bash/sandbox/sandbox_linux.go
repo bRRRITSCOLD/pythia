@@ -69,7 +69,7 @@ func execSandboxed(ctx context.Context, p Policy, command string, stdout, stderr
 	_ = frameR.Close()
 	_ = errW.Close()
 
-	frameErr := writeFrame(frameW, p.WorkspaceRoot, command)
+	frameErr := writeFrame(frameW, p.WorkspaceRoot, p.TmpDir, command)
 	_ = frameW.Close()
 	if frameErr != nil {
 		_ = cmd.Process.Kill()
