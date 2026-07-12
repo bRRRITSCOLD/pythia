@@ -76,6 +76,13 @@ func stream(ctx context.Context, body io.ReadCloser, ch chan<- core.StreamEvent)
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
+	// toolCalls accumulates across chunks: a reasoning model (e.g. qwen3.5)
+	// streams its tool call in a NON-terminal chunk (done:false) and the
+	// terminal chunk carries none, so harvesting only from the Done line would
+	// drop the call and yield an empty, do-nothing turn. Collect from every
+	// chunk and deliver the whole set on the terminal event.
+	var toolCalls []wireToolCall
+
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
@@ -94,8 +101,10 @@ func stream(ctx context.Context, body io.ReadCloser, ch chan<- core.StreamEvent)
 			}
 		}
 
+		toolCalls = append(toolCalls, wr.Message.ToolCalls...)
+
 		if wr.Done {
-			send(ctx, ch, core.StreamEvent{Done: true, ToolCalls: fromWireToolCalls(wr.Message.ToolCalls)})
+			send(ctx, ch, core.StreamEvent{Done: true, ToolCalls: fromWireToolCalls(toolCalls)})
 			return
 		}
 	}

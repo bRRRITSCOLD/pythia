@@ -124,6 +124,46 @@ func TestProvider_Chat_ToolCallsInResponse_DeliveredOnTerminalEvent(t *testing.T
 	}
 }
 
+// TestProvider_Chat_ToolCallsStreamedBeforeTerminal_StillDelivered covers the
+// reasoning-model shape (e.g. qwen3.5): the model streams its tool call in a
+// NON-terminal chunk (done:false) and the terminal chunk (done:true) carries
+// no tool_calls. The adapter must accumulate tool calls across chunks and
+// deliver them on the terminal Done event — harvesting only from the done line
+// drops the call and yields an empty, do-nothing turn.
+func TestProvider_Chat_ToolCallsStreamedBeforeTerminal_StillDelivered(t *testing.T) {
+	srv := httptest.NewServer(ndjsonHandler(
+		`{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"bash","arguments":{"command":"ls"}}}]},"done":false}`,
+		`{"message":{"role":"assistant","content":""},"done":true}`,
+	))
+	defer srv.Close()
+
+	p := ollama.New(srv.URL, "qwen3.5", srv.Client())
+	ch, err := p.Chat(context.Background(), core.ChatRequest{
+		Messages: []core.Message{{Role: core.RoleUser, Content: "run bash: ls"}},
+		Tools: []core.ToolSchema{
+			{Name: "bash", Description: "runs a command", Parameters: json.RawMessage(`{}`)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Chat() error = %v, want nil", err)
+	}
+
+	events := collect(t, ch, 5*time.Second)
+	if len(events) == 0 {
+		t.Fatal("got 0 events, want a terminal Done carrying the streamed tool call")
+	}
+	last := events[len(events)-1]
+	if !last.Done || last.Err != nil {
+		t.Fatalf("last event = %+v, want terminal Done with no error", last)
+	}
+	if len(last.ToolCalls) != 1 {
+		t.Fatalf("got %d tool calls on Done, want 1 (the call streamed before the terminal line): %+v", len(last.ToolCalls), last.ToolCalls)
+	}
+	if last.ToolCalls[0].Name != "bash" {
+		t.Errorf("tool call name = %q, want %q", last.ToolCalls[0].Name, "bash")
+	}
+}
+
 func TestProvider_Chat_OllamaUnreachable_ReturnsSetupError(t *testing.T) {
 	// Bind and immediately close a listener to get a port nothing is
 	// listening on, guaranteeing a connection-refused dial error.
