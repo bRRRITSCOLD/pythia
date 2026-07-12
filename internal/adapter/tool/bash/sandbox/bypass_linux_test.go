@@ -216,7 +216,18 @@ func TestSandbox_BinaryOverwriteAttempt_DeniedReExecIntegrityHeld(t *testing.T) 
 // root + tmp only). Proves the attempt is denied and the file is left
 // byte-for-byte untouched.
 func TestSandbox_SessionDBTamperAttempt_Denied(t *testing.T) {
-	stateDir := t.TempDir()
+	// The DB must sit OUTSIDE the write scope (workspace + /tmp). The real
+	// DB is relocated to ~/.local/state/pythia (T1); model that with a
+	// $HOME dir here — t.TempDir() would be under /tmp, which IS in scope.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+	stateDir, err := os.MkdirTemp(home, ".pythia-sandbox-outside-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp under $HOME: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(stateDir) })
 	dbPath := filepath.Join(stateDir, "sessions.db")
 	original := []byte("sqlite-format-3-placeholder-session-data")
 	if err := os.WriteFile(dbPath, original, 0o644); err != nil {

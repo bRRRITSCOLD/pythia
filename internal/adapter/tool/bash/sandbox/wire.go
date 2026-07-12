@@ -23,14 +23,20 @@ import (
 // attacker-supplied 32-bit length prefix.
 const maxFrameFieldBytes = 8 << 20 // 8 MiB
 
-// writeFrame emits the wire format {u32 len(root)}{root}{u32 len(cmd)}{cmd},
-// big-endian, trusted root first. The root is written by the trusted parent
-// process; the command is attacker-controlled and may contain arbitrary
-// bytes — both are carried as raw length-prefixed byte strings so no byte
-// value requires escaping.
-func writeFrame(w io.Writer, workspaceRoot, command string) error {
+// writeFrame emits the wire format
+// {u32 len(root)}{root}{u32 len(tmpDir)}{tmpDir}{u32 len(cmd)}{cmd},
+// big-endian, trusted fields (root, tmpDir) first and the attacker-controlled
+// command last. root and tmpDir are the writable-scope roots resolved by the
+// trusted parent; both must reach the child so its Landlock ruleset grants
+// writes under /tmp as well as the workspace (SR-3a: write scope =
+// workspace + tmp). The command may contain arbitrary bytes — all are carried
+// as raw length-prefixed byte strings so no byte value requires escaping.
+func writeFrame(w io.Writer, workspaceRoot, tmpDir, command string) error {
 	if err := writeField(w, workspaceRoot); err != nil {
 		return fmt.Errorf("sandbox: write workspace root: %w", err)
+	}
+	if err := writeField(w, tmpDir); err != nil {
+		return fmt.Errorf("sandbox: write tmp dir: %w", err)
 	}
 	if err := writeField(w, command); err != nil {
 		return fmt.Errorf("sandbox: write command: %w", err)
@@ -40,20 +46,24 @@ func writeFrame(w io.Writer, workspaceRoot, command string) error {
 
 // readFrame reads exactly the bytes written by writeFrame. A short or
 // truncated stream, or a length prefix exceeding maxFrameFieldBytes, is a
-// hard error — readFrame never returns a partially decoded root/command
-// pair.
-func readFrame(r io.Reader) (workspaceRoot, command string, err error) {
+// hard error — readFrame never returns a partially decoded field.
+func readFrame(r io.Reader) (workspaceRoot, tmpDir, command string, err error) {
 	workspaceRoot, err = readField(r)
 	if err != nil {
-		return "", "", fmt.Errorf("sandbox: read workspace root: %w", err)
+		return "", "", "", fmt.Errorf("sandbox: read workspace root: %w", err)
+	}
+
+	tmpDir, err = readField(r)
+	if err != nil {
+		return "", "", "", fmt.Errorf("sandbox: read tmp dir: %w", err)
 	}
 
 	command, err = readField(r)
 	if err != nil {
-		return "", "", fmt.Errorf("sandbox: read command: %w", err)
+		return "", "", "", fmt.Errorf("sandbox: read command: %w", err)
 	}
 
-	return workspaceRoot, command, nil
+	return workspaceRoot, tmpDir, command, nil
 }
 
 // writeField writes a single {u32 len}{bytes} field.

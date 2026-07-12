@@ -61,7 +61,7 @@ func runChildWithApply(applyLandlockFn func(Policy) error, applySeccompFn func()
 		return fail(fmt.Errorf("sandbox: frame fd %d unavailable", frameFD))
 	}
 
-	root, command, err := readFrame(frameFile)
+	root, tmpDir, command, err := readFrame(frameFile)
 	_ = frameFile.Close()
 	if err != nil {
 		return fail(fmt.Errorf("sandbox: read frame: %w", err))
@@ -82,7 +82,7 @@ func runChildWithApply(applyLandlockFn func(Policy) error, applySeccompFn func()
 
 	env := scrubEnv(os.Environ())
 
-	if err := applyLandlockFn(Policy{WorkspaceRoot: root}); err != nil {
+	if err := applyLandlockFn(Policy{WorkspaceRoot: root, TmpDir: tmpDir}); err != nil {
 		return fail(fmt.Errorf("sandbox: apply landlock: %w", err))
 	}
 	if err := applySeccompFn(); err != nil {

@@ -15,33 +15,37 @@ func TestFrame_RoundTrip_PreservesArbitraryBytes(t *testing.T) {
 
 	cases := map[string]struct {
 		root string
+		tmp  string
 		cmd  string
 	}{
-		"empty":       {root: "", cmd: ""},
-		"simple":      {root: "/workspace/root", cmd: "echo hello"},
-		"newline":     {root: "/workspace/root", cmd: "echo hello\nrm -rf /\n"},
-		"nul-byte":    {root: "/workspace/root", cmd: "echo \x00 hidden"},
-		"metachars":   {root: "/workspace/root", cmd: "echo $(whoami); `id` && cat /etc/passwd | tee out > file 2>&1 & ; ; $HOME"},
-		"1mib-cmd":    {root: "/workspace/root", cmd: large},
-		"unicode":     {root: "/工作区/根", cmd: "echo 你好 🚀"},
-		"root-binary": {root: "root\x00\nwith\x00binary", cmd: "cmd"},
+		"empty":       {root: "", tmp: "", cmd: ""},
+		"simple":      {root: "/workspace/root", tmp: "/tmp", cmd: "echo hello"},
+		"newline":     {root: "/workspace/root", tmp: "/tmp", cmd: "echo hello\nrm -rf /\n"},
+		"nul-byte":    {root: "/workspace/root", tmp: "/tmp", cmd: "echo \x00 hidden"},
+		"metachars":   {root: "/workspace/root", tmp: "/tmp", cmd: "echo $(whoami); `id` && cat /etc/passwd | tee out > file 2>&1 & ; ; $HOME"},
+		"1mib-cmd":    {root: "/workspace/root", tmp: "/tmp", cmd: large},
+		"unicode":     {root: "/工作区/根", tmp: "/临时", cmd: "echo 你好 🚀"},
+		"root-binary": {root: "root\x00\nwith\x00binary", tmp: "tmp\x00\nbinary", cmd: "cmd"},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			var buf bytes.Buffer
 
-			if err := writeFrame(&buf, tc.root, tc.cmd); err != nil {
+			if err := writeFrame(&buf, tc.root, tc.tmp, tc.cmd); err != nil {
 				t.Fatalf("writeFrame: unexpected error: %v", err)
 			}
 
-			gotRoot, gotCmd, err := readFrame(&buf)
+			gotRoot, gotTmp, gotCmd, err := readFrame(&buf)
 			if err != nil {
 				t.Fatalf("readFrame: unexpected error: %v", err)
 			}
 
 			if gotRoot != tc.root {
 				t.Errorf("root mismatch: got %q want %q", gotRoot, tc.root)
+			}
+			if gotTmp != tc.tmp {
+				t.Errorf("tmp mismatch: got %q want %q", gotTmp, tc.tmp)
 			}
 			if gotCmd != tc.cmd {
 				t.Errorf("command mismatch: got len=%d want len=%d", len(gotCmd), len(tc.cmd))
@@ -60,19 +64,19 @@ func TestFrame_RoundTrip_PreservesArbitraryBytes(t *testing.T) {
 // adversarial: a desynchronised frame must not be silently tolerated).
 func TestFrame_TruncatedStream_ErrorsNoPartialAccept(t *testing.T) {
 	var full bytes.Buffer
-	if err := writeFrame(&full, "/workspace/root", "echo hello world"); err != nil {
+	if err := writeFrame(&full, "/workspace/root", "/tmp", "echo hello world"); err != nil {
 		t.Fatalf("writeFrame: unexpected error: %v", err)
 	}
 	complete := full.Bytes()
 
 	// Truncate at every possible byte offset short of the full frame, plus
 	// the empty stream. Every one of these must error, never partially
-	// decode a root/command pair.
+	// decode a field.
 	for cut := 0; cut < len(complete); cut++ {
 		truncated := bytes.NewReader(complete[:cut])
-		root, cmd, err := readFrame(truncated)
+		root, tmp, cmd, err := readFrame(truncated)
 		if err == nil {
-			t.Fatalf("cut=%d: expected error on truncated stream, got root=%q cmd=%q", cut, root, cmd)
+			t.Fatalf("cut=%d: expected error on truncated stream, got root=%q tmp=%q cmd=%q", cut, root, tmp, cmd)
 		}
 	}
 }
@@ -86,7 +90,7 @@ func TestFrame_AbsurdLengthClaim_Rejected(t *testing.T) {
 		var buf bytes.Buffer
 		writeU32(&buf, 0xFFFFFFFF) // claims ~4 GiB root
 
-		_, _, err := readFrame(&buf)
+		_, _, _, err := readFrame(&buf)
 		if err == nil {
 			t.Fatal("expected error for absurd root length claim, got nil")
 		}
@@ -99,7 +103,7 @@ func TestFrame_AbsurdLengthClaim_Rejected(t *testing.T) {
 		buf.WriteString(root)
 		writeU32(&buf, 0xFFFFFFFF) // claims ~4 GiB command
 
-		_, _, err := readFrame(&buf)
+		_, _, _, err := readFrame(&buf)
 		if err == nil {
 			t.Fatal("expected error for absurd command length claim, got nil")
 		}
@@ -112,7 +116,7 @@ func TestFrame_AbsurdLengthClaim_Rejected(t *testing.T) {
 		buf.WriteString(root)
 		writeU32(&buf, maxFrameFieldBytes+1)
 
-		_, _, err := readFrame(&buf)
+		_, _, _, err := readFrame(&buf)
 		if err == nil {
 			t.Fatal("expected error for length claim just over the cap, got nil")
 		}
