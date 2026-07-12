@@ -20,6 +20,7 @@ import (
 	"github.com/bRRRITSCOLD/pythia/internal/adapter/provider/ollama"
 	"github.com/bRRRITSCOLD/pythia/internal/adapter/store/sqlite"
 	"github.com/bRRRITSCOLD/pythia/internal/adapter/tool/bash"
+	"github.com/bRRRITSCOLD/pythia/internal/adapter/tool/bash/sandbox"
 	"github.com/bRRRITSCOLD/pythia/internal/adapter/tool/edit"
 	"github.com/bRRRITSCOLD/pythia/internal/adapter/tool/read"
 	"github.com/bRRRITSCOLD/pythia/internal/adapter/tool/registry"
@@ -30,6 +31,16 @@ import (
 )
 
 func main() {
+	// Reserved re-exec hook (ADR-0005 §3): when the bash sandbox spine
+	// re-execs this same binary via /proc/self/exe, it does so with this
+	// exact argv[1] marker. This must be the very first thing main does —
+	// before config.Load, before the TUI — and must never fall through to
+	// the normal startup path below (sandbox.RunChild never returns on
+	// success; it execve's into /bin/bash).
+	if len(os.Args) > 1 && os.Args[1] == sandbox.ChildSubcommand {
+		os.Exit(sandbox.RunChild())
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "pythia:", err)
