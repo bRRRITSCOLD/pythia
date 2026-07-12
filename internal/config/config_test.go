@@ -20,12 +20,21 @@ var envVars = []string{
 	"PYTHIA_MAX_BASH_OUTPUT_BYTES",
 	"PYTHIA_MAX_ITERATIONS",
 	"PYTHIA_SESSION_ID",
+	"PYTHIA_BASH_SANDBOX",
 }
 
 // unsetAll unsets every config env var for the duration of the test and
 // restores each var's prior value (or absence) on cleanup. t.Setenv can only
 // set a value, never truly unset one, so tests that need to exercise
 // defaulting for a genuinely-unset var must unset directly via os.Unsetenv.
+//
+// It also points XDG_STATE_HOME at a fresh per-test temp dir so that any
+// test reaching defaultDBPath() (i.e. one that leaves PYTHIA_DB_PATH unset)
+// provisions its default state dir under that temp dir instead of mutating
+// the real $HOME/.local/state/pythia on the developer's machine or CI
+// runner. t.TempDir() returns a distinct directory per call, so this never
+// collides with a separately-set PYTHIA_WORKSPACE_ROOT temp dir, preserving
+// the "default DB path is outside the workspace" invariant.
 func unsetAll(t *testing.T) {
 	t.Helper()
 	for _, v := range envVars {
@@ -39,6 +48,7 @@ func unsetAll(t *testing.T) {
 			}
 		})
 	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 }
 
 func TestLoad_NoEnvSet_AppliesValidDefaults(t *testing.T) {
@@ -56,8 +66,14 @@ func TestLoad_NoEnvSet_AppliesValidDefaults(t *testing.T) {
 	if cfg.OllamaModel != "qwen3.5" {
 		t.Errorf("OllamaModel = %q, want default", cfg.OllamaModel)
 	}
-	if cfg.DBPath != "./pythia.db" {
-		t.Errorf("DBPath = %q, want default", cfg.DBPath)
+	if filepath.Base(cfg.DBPath) != "pythia.db" {
+		t.Errorf("DBPath = %q, want a path ending in pythia.db", cfg.DBPath)
+	}
+	if !filepath.IsAbs(cfg.DBPath) {
+		t.Errorf("DBPath = %q, want an absolute path", cfg.DBPath)
+	}
+	if cfg.BashSandbox != config.SandboxOn {
+		t.Errorf("BashSandbox = %v, want SandboxOn", cfg.BashSandbox)
 	}
 	if cfg.BashTimeout != 30*time.Second {
 		t.Errorf("BashTimeout = %v, want 30s", cfg.BashTimeout)
@@ -119,6 +135,97 @@ func TestLoad_ZeroOrNegativeTuningKnob_ReturnsError(t *testing.T) {
 	}
 }
 
+// TestLoad_BashSandboxUnset_DefaultsOn locks in SR-3a.11: the sandbox is on
+// by default when PYTHIA_BASH_SANDBOX is unset.
+func TestLoad_BashSandboxUnset_DefaultsOn(t *testing.T) {
+	unsetAll(t)
+	t.Setenv("PYTHIA_WORKSPACE_ROOT", t.TempDir())
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.BashSandbox != config.SandboxOn {
+		t.Errorf("BashSandbox = %v, want SandboxOn", cfg.BashSandbox)
+	}
+}
+
+// TestLoad_BashSandboxOff_ParsesOff locks in SR-3a.11: only the exact token
+// "off" disables the sandbox.
+func TestLoad_BashSandboxOff_ParsesOff(t *testing.T) {
+	unsetAll(t)
+	t.Setenv("PYTHIA_WORKSPACE_ROOT", t.TempDir())
+	t.Setenv("PYTHIA_BASH_SANDBOX", "off")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.BashSandbox != config.SandboxOff {
+		t.Errorf("BashSandbox = %v, want SandboxOff", cfg.BashSandbox)
+	}
+}
+
+// TestLoad_BashSandboxGarbage_FailsClosedToOn locks in SR-3a.11's fail-safe
+// requirement: any value other than the exact token "off" (including
+// unrecognized garbage) resolves to SandboxOn.
+func TestLoad_BashSandboxGarbage_FailsClosedToOn(t *testing.T) {
+	garbageValues := []string{"On", "OFF", "0", "false", "disabled", "off ", " off", "yes"}
+
+	for _, v := range garbageValues {
+		t.Run(v, func(t *testing.T) {
+			unsetAll(t)
+			t.Setenv("PYTHIA_WORKSPACE_ROOT", t.TempDir())
+			t.Setenv("PYTHIA_BASH_SANDBOX", v)
+
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatalf("Load() returned error: %v", err)
+			}
+			if cfg.BashSandbox != config.SandboxOn {
+				t.Errorf("BashSandbox = %v for %q, want SandboxOn (fail-safe)", cfg.BashSandbox, v)
+			}
+		})
+	}
+}
+
+// TestLoad_DefaultDBPath_IsOutsideWorkspace locks in SR-3a.13: the default
+// DB path must not resolve inside the (sandboxed, writable) workspace root,
+// so a sandboxed bash command cannot rm/tamper the session DB.
+func TestLoad_DefaultDBPath_IsOutsideWorkspace(t *testing.T) {
+	unsetAll(t)
+	workspace := t.TempDir()
+	t.Setenv("PYTHIA_WORKSPACE_ROOT", workspace)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+
+	rel, err := filepath.Rel(cfg.WorkspaceRoot, cfg.DBPath)
+	isOutside := err != nil || rel == ".." || (len(rel) >= 3 && rel[:3] == ".."+string(filepath.Separator))
+	if !isOutside {
+		t.Errorf("DBPath = %q resolves inside WorkspaceRoot %q", cfg.DBPath, cfg.WorkspaceRoot)
+	}
+}
+
+// TestLoad_ExplicitDBPath_HonoredVerbatim locks in SR-3a.13: an operator
+// override of PYTHIA_DB_PATH is honored exactly, even if it happens to sit
+// inside the workspace (operator's explicit choice).
+func TestLoad_ExplicitDBPath_HonoredVerbatim(t *testing.T) {
+	unsetAll(t)
+	t.Setenv("PYTHIA_WORKSPACE_ROOT", t.TempDir())
+	t.Setenv("PYTHIA_DB_PATH", "/tmp/explicit-pythia.db")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.DBPath != "/tmp/explicit-pythia.db" {
+		t.Errorf("DBPath = %q, want verbatim override", cfg.DBPath)
+	}
+}
+
 func TestLoad_NonexistentWorkspaceRoot_FailsValidation(t *testing.T) {
 	unsetAll(t)
 	t.Setenv("PYTHIA_WORKSPACE_ROOT", "/this/path/does/not/exist/pythia-test")
@@ -141,6 +248,7 @@ func TestLoad_AllEnvSet_OverridesDefaults(t *testing.T) {
 	t.Setenv("PYTHIA_MAX_BASH_OUTPUT_BYTES", "4096")
 	t.Setenv("PYTHIA_MAX_ITERATIONS", "25")
 	t.Setenv("PYTHIA_SESSION_ID", "session-abc")
+	t.Setenv("PYTHIA_BASH_SANDBOX", "off")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -177,5 +285,8 @@ func TestLoad_AllEnvSet_OverridesDefaults(t *testing.T) {
 	}
 	if cfg.SessionID != "session-abc" {
 		t.Errorf("SessionID = %q", cfg.SessionID)
+	}
+	if cfg.BashSandbox != config.SandboxOff {
+		t.Errorf("BashSandbox = %v, want SandboxOff", cfg.BashSandbox)
 	}
 }
