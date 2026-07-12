@@ -72,18 +72,30 @@ not run.
 
 ## Design
 
+> **Threat pass applied.** The mechanisms below incorporate the 11 must-fix
+> corrections from `docs/security/bash-sandbox-threat-model.md` — the naive
+> "deny `AF_INET` + syscall denylist" design was proven bypassable
+> (io_uring, `AF_UNIX`→host daemons, x32, inherited fds). Read that doc for the
+> full bypass analysis; the corrected controls are load-bearing, not optional.
+
 ### Mechanisms (all pure-Go — `CGO_ENABLED=0` static binary preserved)
 
-| Layer      | Mechanism                                   | Policy |
+| Layer      | Mechanism                                   | Policy (corrected) |
 |------------|---------------------------------------------|--------|
-| Filesystem | Landlock (`github.com/landlock-lsm/go-landlock`) | read broad; write only workspace root + `/tmp` |
-| Network    | seccomp — deny `socket(AF_INET/AF_INET6, …)` | no outbound/inbound network |
-| Syscalls   | seccomp-bpf allowlist (`github.com/elastic/go-seccomp-bpf`) | deny `ptrace`, `mount`, `kexec_load`, `bpf`, `add_key`, `unshare`, `pivot_root`, module/swap/reboot families |
-| Env        | allowlist scrub                             | keep `PATH`, `HOME`, `TERM`, `LANG`; drop everything else |
+| Filesystem | Landlock (`github.com/landlock-lsm/go-landlock`), **strict min-ABI ≥ 2, fail-closed** | read broad; write only workspace root + `/tmp`. ABI ≥ 2 required so REFER-gated hardlink escapes are closed; refuse (fail-closed) on older kernels rather than degrade. |
+| Network    | seccomp — deny `socket()` for **all address families** + block **io_uring** (`io_uring_setup`/`enter`) | no network. Denying only `AF_INET/6` is insufficient: `AF_UNIX` reaches host daemons (`docker.sock` = host takeover), `AF_NETLINK` leaks; io_uring submits `SOCKET`/`CONNECT` as ring ops that never hit the syscall layer. |
+| Syscalls   | seccomp-bpf **allowlist (default-deny)** (`github.com/elastic/go-seccomp-bpf`), **arch-validated (block x32/foreign)**, **`NO_NEW_PRIVS` set** | allowlist, not denylist — only default-deny fails safe against multiplexers, `process_vm_readv/writev`, `userfaultfd`, `kcmp`, x32, and future syscalls. Lethal set (`ptrace`, `process_vm_*`, `mount`, `pivot_root`, `kexec`, module/key/`bpf`/io_uring/`userfaultfd`/`unshare`/reboot/swap, foreign-arch) → `KILL_PROCESS`. |
+| Env        | allowlist scrub + **fixed `PATH` constant**, bash by **absolute path** | keep `HOME`/`TERM`/`LANG`; `PATH` is a fixed constant (never inherited — a prior command could plant a fake `bash`/`curl`); resolve/exec `/bin/bash` by absolute path. Allowlist correctly drops `LD_PRELOAD`/`BASH_ENV`/`ENV`/`IFS`. |
 
 Both libraries are pure Go and operate via `x/sys/unix` syscalls, so the
 static-binary constraint (ADR-0004-adjacent, first slice) holds. `libseccomp`
 (CGO) is explicitly rejected.
+
+**seccomp default action (settled):** per-syscall, not one-size — `ENOSYS` for
+the unknown long tail (libc feature-probes degrade gracefully), `EACCES`/
+`EAFNOSUPPORT` for sockets (so `curl` fails cleanly and the model stops
+retrying), `KILL_PROCESS` for the lethal set above and any foreign-arch attempt
+(loud, un-catchable, no SIGSYS retry loop).
 
 ### Application mechanism — self re-exec
 
@@ -95,21 +107,33 @@ Go code between fork and exec), so the idiomatic pattern is **re-exec of self**:
 
 ```
 pythia
-  └─ exec.Command(self, "__bash-sandbox")      // parent stays unsandboxed
-       └─ (child) apply env scrub
-          └─ apply Landlock ruleset
-             └─ apply seccomp filter (TSYNC)
-                └─ syscall.Exec("bash", ["bash","-c",cmd], scrubbedEnv)
-                     // Landlock + seccomp persist across execve into bash
+  └─ exec.Command(/proc/self/exe, "__bash-sandbox")   // re-exec self by /proc/self/exe
+       │  ← ALL parent fds close-on-exec (no Ollama socket / SQLite handle leaks in)
+       │  ← command + policy delivered via length-prefixed pipe (never argv/env)
+       └─ (child) set NO_NEW_PRIVS
+          └─ apply env scrub (fixed PATH constant)
+             └─ apply Landlock ruleset (strict ABI ≥ 2)
+                └─ apply seccomp filter (allowlist, arch-validated, TSYNC)
+                   └─ syscall.Exec("/bin/bash", ["bash","-c",cmd], scrubbedEnv)
+                        // Landlock + seccomp persist across execve into bash
 ```
 
-- The child is Pythia re-invoked with a reserved first arg (`__bash-sandbox`).
-  `cmd/pythia/main.go` detects this arg **before** loading config or starting
-  the TUI, runs the sandbox-child entrypoint, and never returns to the TUI
-  path.
-- The command string and the resolved policy (workspace root) are passed to the
-  child out-of-band (stdin pipe or a dedicated env var set only on the child's
-  `exec.Cmd`), never as a shell-visible argv token.
+- The child is Pythia re-invoked **from `/proc/self/exe`** (not `os.Args[0]`,
+  which a writable-scope binary swap could subvert) with a reserved first arg
+  (`__bash-sandbox`). `cmd/pythia/main.go` detects this arg **before** loading
+  config or starting the TUI, runs the sandbox-child entrypoint, never returns
+  to the TUI path.
+- **All inherited parent fds must be close-on-exec.** An inherited connected
+  socket defeats network denial (`sendmsg` needs no `socket()`); an inherited
+  writable fd defeats Landlock (access is checked at open time, not per-write).
+- The command string and resolved policy (workspace root) are passed to the
+  child **out-of-band via a length-prefixed pipe** — never argv (attacker
+  controls command bytes; newline/NUL desync delimiter framing) and never a
+  shell-visible env token.
+- **The session DB and the binary must live outside the writable scope.** With
+  defaults `./pythia.db` and often the binary sit *inside* the workspace; a
+  command could tamper session history or overwrite the binary and break
+  re-exec integrity. Relocate/deny both.
 - stdout/stderr/exit-code/timeout/truncation semantics are unchanged — the
   parent still wires the bounded buffers and the context timeout onto the child
   `exec.Cmd`, so the existing `output` envelope is preserved.
@@ -162,11 +186,32 @@ tests for the env-allowlist filter and the policy/config plumbing. The
 `internal/arch` guard runs unchanged and must stay green (core still
 stdlib-only).
 
-## Open questions
+Additional bypass-probe tests seeded by the threat model (each proves a
+must-fix control): `AF_UNIX`/`AF_NETLINK` socket probe → denied; an io_uring
+network/open attempt → denied (or KILL); an x32 / i386 syscall attempt → KILL;
+inherited-fd probe (parent leaks a socket/writable fd) → not present in child;
+hardlink-out-of-scope-then-write → denied (Landlock ABI ≥ 2); fake `bash`/`curl`
+planted on a writable PATH dir → not used (fixed PATH, absolute exec); binary/DB
+overwrite attempt → denied (outside writable scope).
 
-- Exact seccomp action for denied syscalls: `EPERM` (errno, lets bash continue
-  and report) vs `SIGSYS`/kill (harder failure). Lean `EPERM` for network/most,
-  kill for the truly-never-legitimate set — final call in the ADR.
-- Landlock ABI best-effort vs strict: require a minimum ABI and fail-closed on
-  older kernels, vs degrade to the best ruleset the kernel supports. Lean
-  strict/fail-closed given the security goal — confirm in the ADR.
+## Residual risk (sandbox cannot close — must be documented)
+
+The bash tool returns **stdout to the model/provider**. A command can
+`cat ~/.ssh/id_rsa` and exfiltrate through the tool-output channel — network
+denial does not touch this path. Acceptable **only because the provider (Ollama)
+is local**; that assumption is load-bearing (SR-3a.H2 in the threat model). If a
+remote provider is ever added, this reopens and needs a read-denylist or
+output-scrubbing revisit.
+
+## Settled (were open questions)
+
+- **seccomp action** → per-syscall: `ENOSYS` for the unknown tail, `EACCES`/
+  `EAFNOSUPPORT` for sockets, `KILL_PROCESS` for the lethal set + foreign-arch.
+- **Landlock ABI** → strict minimum ≥ 2, fail-closed; no best-effort degrade.
+- **allowlist vs denylist** → allowlist (default-deny), firm — the only design
+  that fails safe against io_uring, multiplexers, `process_vm_*`, x32, and
+  future syscalls.
+
+Full rationale, STRIDE table, per-control bypass analysis, and the 14 must-fix
++ 3 hardening security requirements (SR-3a.1–.14, SR-3a.H1–H3) live in
+`docs/security/bash-sandbox-threat-model.md` and seed the build plan.
