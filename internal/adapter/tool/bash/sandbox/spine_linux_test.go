@@ -183,23 +183,25 @@ func TestRun_WorkDir_ChildRunsInWorkspaceRoot(t *testing.T) {
 	}
 }
 
-// TestRun_ProductionPath_FailsClosedUntilSeccompImplemented documents and
-// locks in the current, intentional posture of the real production path
-// (ChildSubcommand, i.e. what bashTool.Invoke drives): until T7 (#103)
-// replaces applySeccomp's fail-closed stub with a real filter, Run must
-// refuse to run the command rather than silently presenting as fully
-// sandboxed with no syscall filter installed (ADR-0005 §5, SR-3a
-// fail-closed). This test should be updated (or deleted, folded back into
-// TestRun_SimpleCommand_ReExecsAndReturnsOutput et al.) once T7 lands.
-func TestRun_ProductionPath_FailsClosedUntilSeccompImplemented(t *testing.T) {
+// TestRun_ProductionPath_RunsWithRealSeccomp exercises the real production
+// path (ChildSubcommand, i.e. what bashTool.Invoke drives) now that T7
+// (#103) has replaced applySeccomp's fail-closed stub with a real filter:
+// a benign command must run to completion through the full frozen
+// sequence — real Landlock and real seccomp both installed, unlike the
+// noSeccompSubcommand test double the rest of this file's spine-mechanics
+// tests use.
+func TestRun_ProductionPath_RunsWithRealSeccomp(t *testing.T) {
 	var out bytes.Buffer
-	_, err := Run(context.Background(), Policy{WorkspaceRoot: t.TempDir(), TmpDir: "/tmp"},
-		"echo should-not-run", &out, io.Discard)
-	if !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("Run err = %v, want wrapping ErrUnsupported (seccomp not yet implemented)", err)
+	code, err := Run(context.Background(), Policy{WorkspaceRoot: t.TempDir(), TmpDir: "/tmp"},
+		"echo production-ok", &out, io.Discard)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
 	}
-	if out.Len() != 0 {
-		t.Errorf("command produced output despite fail-closed setup failure: %q", out.String())
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+	if got := strings.TrimSpace(out.String()); got != "production-ok" {
+		t.Errorf("stdout = %q, want %q", got, "production-ok")
 	}
 }
 
